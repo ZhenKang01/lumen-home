@@ -1,12 +1,12 @@
-// Mock Mend API for testing Lumen Home. Node only, no dependencies.
+// Mock of the Mend backend (n8n webhook) for testing Lumen Home. Node only, no dependencies.
 //
-//   node mock-api.js            -> http://localhost:8787, API key "test-key"
-//   PORT=9000 MOCK_KEY=abc node mock-api.js
-//   MOCK_FAIL=1 node mock-api.js   -> every event POST returns 500 (to test retries and errors)
+//   MOCK_TEAM_CODE=pick-any-code node mock-api.js    -> http://localhost:8787, API key "test-key"
+//   PORT=9000 MOCK_KEY=abc MOCK_TEAM_CODE=xyz node mock-api.js
 //
-// Then in config.js set API_URL: "http://localhost:8787", API_KEY: "test-key", and a TEAM_CODE.
-// The mock pretends the customer pressed Start in Telegram 5 seconds after asking for a link.
-// GET /__inspect shows what was received (test helper; a real API must not expose this).
+// Then point a local copy of config.js at it: API_URL "http://localhost:8787", API_KEY "test-key".
+// Type the same MOCK_TEAM_CODE into the Account page to connect.
+// The mock pretends the shopper pressed Start in Telegram 5 seconds after asking for a link
+// (MOCK_CONNECT_MS changes that). GET /__inspect shows what it received (test helper only).
 "use strict";
 
 const http = require("http");
@@ -14,46 +14,86 @@ const crypto = require("crypto");
 
 const PORT = Number(process.env.PORT || 8787);
 const KEY = process.env.MOCK_KEY || "test-key";
-const FAIL_EVENTS = process.env.MOCK_FAIL === "1";
+const TEAM_CODE = process.env.MOCK_TEAM_CODE || crypto.randomBytes(6).toString("hex");
 const AUTO_CONNECT_MS = Number(process.env.MOCK_CONNECT_MS || 5000);
 
-// Exactly the fields from the contract (README, "Event payload").
+const CATEGORIES = ["Lighting", "Furniture", "Kitchen", "Textiles", "Decor", "Storage"];
+const isCustomer = v => typeof v === "string" && /^c_[a-z0-9]{4,24}$/.test(v);
+const isName = v => typeof v === "string" && /^\p{L}{1,20}$/u.test(v);
+const isOrder = v => typeof v === "string" && /^LH-\d{3,8}$/.test(v);
+const isIso = v => typeof v === "string" && !isNaN(Date.parse(v));
+
+// Problem event fields (README, "Problem events").
 const EVENT_FIELDS = {
+  action: v => v === "late_delivery" || v === "bad_review",
   event_type: v => v === "late_delivery" || v === "bad_review",
-  customer_id: v => typeof v === "string" && /^c_[0-9a-f]{6}$/.test(v),
-  first_name: v => typeof v === "string" && v.length > 0 && v.length <= 30,
-  order_id: v => typeof v === "string" && /^LH-\d{4,}$/.test(v),
+  customer_id: isCustomer,
+  first_name: isName,
+  order_id: isOrder,
   product_id: v => typeof v === "string" && v.length > 0,
   product_name: v => typeof v === "string" && v.length > 0,
-  category: v => ["Lighting", "Furniture", "Kitchen", "Textiles", "Decor", "Storage"].includes(v),
+  category: v => CATEGORIES.includes(v),
   order_value: v => typeof v === "number" && v > 0,
   delivery_fee: v => typeof v === "number" && v >= 0,
   days_late: v => Number.isInteger(v) && v >= 0,
   review_score: v => v === null || (Number.isInteger(v) && v >= 1 && v <= 5),
   review_text: v => typeof v === "string" && v.length <= 400,
-  promised_at: v => typeof v === "string" && !isNaN(Date.parse(v)) && v.endsWith("Z"),
-  delivered_at: v => typeof v === "string" && !isNaN(Date.parse(v)) && v.endsWith("Z"),
-  prior_orders: v => Number.isInteger(v) && v >= 0,
-  telegram_connected: v => typeof v === "boolean"
+  promised_at: isIso,
+  delivered_at: isIso,
+  prior_orders: v => Number.isInteger(v) && v >= 0
 };
+const OPTIONAL_FIELDS = { telegram_connected: v => typeof v === "boolean" };
 
-const received = [];        // full payloads, for /__inspect
-const customers = new Map(); // customer_id -> { token, expires_at, asked_at, connected, stopped }
-const actions = [];         // every action call, for /__inspect
+const customers = new Map(); // customer_id -> { first_name, token, asked_at, connected }
+const openCases = new Map(); // customer_id -> case_id
+const reported = new Set();  // customer_id|order_id|event_type
+const events = [];           // what the staff view sees
+const received = [];         // full event bodies, for /__inspect
+const actions = [];          // every action call, for /__inspect
 
 function validateEvent(body) {
   const problems = [];
-  const keys = Object.keys(body);
-  for (const k of keys) if (!(k in EVENT_FIELDS)) problems.push("unexpected field: " + k);
-  for (const k of Object.keys(EVENT_FIELDS)) {
+  for (const k of Object.keys(body)) if (!(k in EVENT_FIELDS) && !(k in OPTIONAL_FIELDS)) problems.push("unexpected field: " + k);
+  for (const [k, ok] of Object.entries(EVENT_FIELDS)) {
     if (!(k in body)) problems.push("missing field: " + k);
-    else if (!EVENT_FIELDS[k](body[k])) problems.push("bad value for " + k + ": " + JSON.stringify(body[k]));
+    else if (!ok(body[k])) problems.push("bad value for " + k + ": " + JSON.stringify(body[k]));
   }
-  if (body.event_type === "late_delivery" && body.days_late < 1) problems.push("late_delivery needs days_late >= 1");
+  for (const [k, ok] of Object.entries(OPTIONAL_FIELDS)) if (k in body && !ok(body[k])) problems.push("bad value for " + k);
+  if (body.action !== body.event_type) problems.push("action and event_type must match");
   if (body.event_type === "late_delivery" && body.review_score !== null) problems.push("late_delivery needs review_score null");
-  if (body.event_type === "bad_review" && !(body.review_score <= 2)) problems.push("bad_review needs review_score <= 2");
-  if (body.telegram_connected !== true) problems.push("events must only be sent when telegram_connected is true");
   return problems;
+}
+
+function statusFor(id) {
+  const c = customers.get(id);
+  if (!c) return "not_connected";
+  if (c.connected) return "connected";
+  if (c.token && Date.now() - c.asked_at >= AUTO_CONNECT_MS) { c.connected = true; c.token = null; return "connected"; }
+  return c.token ? "waiting" : "not_connected";
+}
+
+function handleEvent(b) {
+  const decide = () => {
+    if (b.event_type === "late_delivery" && b.days_late < 1) return { sent: false, reason: "on_time" };
+    if (b.event_type === "bad_review" && b.review_score > 2) return { sent: false, reason: "review_not_low" };
+    if (statusFor(b.customer_id) !== "connected") return { sent: false, reason: "not_connected" };
+    const key = b.customer_id + "|" + b.order_id + "|" + b.event_type;
+    if (reported.has(key)) return { sent: false, reason: "duplicate" };
+    if (openCases.has(b.customer_id)) return { sent: false, reason: "open_case" };
+    reported.add(key);
+    const case_id = "case_" + crypto.randomBytes(4).toString("hex");
+    openCases.set(b.customer_id, case_id);
+    return { sent: true, case_id };
+  };
+  const result = decide();
+  events.push({
+    at: new Date().toISOString(), event_type: b.event_type, first_name: b.first_name, order_id: b.order_id,
+    product_name: b.product_name, status: result.sent ? "sent" : "not_sent",
+    outcome: result.sent ? "Telegram message sent (mock)" : result.reason,
+    _customer: b.customer_id
+  });
+  console.log(`[${b.event_type}] ${b.customer_id} ${b.order_id} -> ${result.sent ? "sent " + result.case_id : result.reason}`);
+  return Object.assign({ ok: true }, result);
 }
 
 function send(res, status, obj) {
@@ -66,73 +106,73 @@ function send(res, status, obj) {
   res.end(obj === undefined ? "" : JSON.stringify(obj));
 }
 
-function statusFor(id) {
-  const c = customers.get(id);
-  if (!c || c.stopped) return "not_connected";
-  if (c.connected) return "connected";
-  if (Date.now() - c.asked_at >= AUTO_CONNECT_MS) { c.connected = true; return "connected"; }
-  return "waiting";
-}
-
 const server = http.createServer((req, res) => {
   if (req.method === "OPTIONS") return send(res, 204);
-  if (req.method === "GET" && req.url === "/__inspect") return send(res, 200, { received, actions, customers: [...customers.keys()] });
-  if (req.method !== "POST") return send(res, 405, { error: "POST only" });
-  if (req.headers["x-api-key"] !== KEY) return send(res, 401, { error: "bad api key" });
+  if (req.method === "GET" && req.url === "/__inspect") return send(res, 200, { received, actions, openCases: [...openCases.keys()] });
+  if (req.method !== "POST") return send(res, 405, { error: "post_only" });
+  if (req.headers["x-api-key"] !== KEY) return send(res, 401, { error: "bad_key" });
 
   let raw = "";
   req.on("data", chunk => { raw += chunk; if (raw.length > 1e5) req.destroy(); });
   req.on("end", () => {
-    let body;
-    try { body = JSON.parse(raw); } catch (e) { return send(res, 400, { error: "invalid JSON" }); }
+    let b;
+    try { b = JSON.parse(raw); } catch (e) { return send(res, 400, { error: "bad_json" }); }
+    if (!b || typeof b !== "object") return send(res, 400, { error: "bad_request" });
+    const id = b.customer_id;
 
-    if (body && body.action) {
-      actions.push({ at: new Date().toISOString(), ...body });
-      const id = body.customer_id;
-      switch (body.action) {
-        case "connect": {
-          if (!id || !body.first_name) return send(res, 400, { error: "customer_id and first_name needed" });
-          const token = crypto.randomBytes(12).toString("hex");
-          const expires_at = new Date(Date.now() + 10 * 60000).toISOString();
-          customers.set(id, { token, expires_at, asked_at: Date.now(), connected: false, stopped: false, first_name: body.first_name });
-          console.log(`[connect] ${id} (${body.first_name}) -> token issued`);
-          return send(res, 200, { token, expires_at });
-        }
-        case "status":
-          return send(res, 200, { status: statusFor(id) });
-        case "stop": {
-          const c = customers.get(id);
-          if (c) { c.stopped = true; c.connected = false; }
-          console.log(`[stop] ${id}`);
-          return send(res, 200, { ok: true });
-        }
-        case "delete":
-          customers.delete(id);
-          for (let i = received.length - 1; i >= 0; i--) if (received[i].customer_id === id) received.splice(i, 1);
-          console.log(`[delete] ${id}`);
-          return send(res, 200, { ok: true });
-        case "events":
-          return send(res, 200, {
-            events: received.slice(-20).reverse().map(e => ({
-              time: e._at, event_type: e.event_type, first_name: e.first_name, order_id: e.order_id,
-              status: "received", outcome: e.event_type === "late_delivery" ? "Delivery fee refund offered (mock)" : "Asked what went wrong (mock)"
-            }))
-          });
-        default:
-          return send(res, 400, { error: "unknown action" });
+    if (b.action === "late_delivery" || b.action === "bad_review") {
+      const problems = validateEvent(b);
+      received.push(b);
+      if (problems.length) {
+        console.log("[event] REJECTED", problems);
+        return send(res, 400, { error: "bad_request", problems });
       }
+      return send(res, 200, handleEvent(b));
     }
 
-    if (FAIL_EVENTS) { console.log("[event] forced 500"); return send(res, 500, { error: "forced failure" }); }
-    const problems = validateEvent(body || {});
-    if (problems.length) {
-      console.log("[event] REJECTED", problems);
-      return send(res, 422, { error: "payload does not match contract", problems });
+    // Never log the team code itself.
+    actions.push(Object.assign({ at: new Date().toISOString() }, b, b.team_code ? { team_code: "(hidden)" } : {}));
+    switch (b.action) {
+      case "connect": {
+        if (!isCustomer(id) || !isName(b.first_name)) return send(res, 400, { error: "bad_request" });
+        if (typeof b.team_code !== "string" || b.team_code !== TEAM_CODE) {
+          console.log(`[connect] ${id} refused: wrong team code`);
+          return send(res, 403, { error: "team_only" });
+        }
+        if (statusFor(id) === "connected") return send(res, 200, { ok: true, connected: true });
+        const token = crypto.randomBytes(12).toString("hex");
+        const expires_at = new Date(Date.now() + 10 * 60000).toISOString();
+        customers.set(id, { first_name: b.first_name, token, asked_at: Date.now(), connected: false });
+        console.log(`[connect] ${id} (${b.first_name}) -> token issued`);
+        return send(res, 200, { ok: true, token, expires_at });
+      }
+      case "status":
+        if (!isCustomer(id)) return send(res, 400, { error: "bad_request" });
+        return send(res, 200, { ok: true, status: statusFor(id) });
+      case "stop":
+        if (!isCustomer(id)) return send(res, 400, { error: "bad_request" });
+        customers.delete(id);
+        openCases.delete(id);
+        console.log(`[stop] ${id}`);
+        return send(res, 200, { ok: true });
+      case "delete":
+        if (!isCustomer(id)) return send(res, 400, { error: "bad_request" });
+        customers.delete(id);
+        openCases.delete(id);
+        for (const k of [...reported]) if (k.startsWith(id + "|")) reported.delete(k);
+        for (let i = events.length - 1; i >= 0; i--) if (events[i]._customer === id) events.splice(i, 1);
+        for (let i = received.length - 1; i >= 0; i--) if (received[i].customer_id === id) received.splice(i, 1);
+        console.log(`[delete] ${id}`);
+        return send(res, 200, { ok: true });
+      case "events":
+        return send(res, 200, {
+          ok: true,
+          events: events.slice(-20).reverse().map(({ _customer, ...e }) => e)
+        });
+      default:
+        return send(res, 400, { error: "unknown_action" });
     }
-    received.push({ ...body, _at: new Date().toISOString() });
-    console.log(`[event] ${body.event_type} ${body.order_id} ${body.product_name} days_late=${body.days_late} score=${body.review_score}`);
-    return send(res, 200, { ok: true });
   });
 });
 
-server.listen(PORT, () => console.log(`Mock Mend API on http://localhost:${PORT} (key "${KEY}")`));
+server.listen(PORT, () => console.log(`Mock Mend API on http://localhost:${PORT} (key "${KEY}"). Team code comes from MOCK_TEAM_CODE.`));

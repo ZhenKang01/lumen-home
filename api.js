@@ -1,15 +1,18 @@
 // api.js
 // If config.API_URL is empty -> "local mode": record the event in the feed only.
-// If set -> POST JSON to API_URL, header "x-api-key: <API_KEY>", 8 s timeout, 2 retries, never block the UI.
+// If set -> POST JSON to API_URL, header "x-api-key: <API_KEY>", 8 s timeout, never block the UI.
 //
 // Every call returns a Promise and never throws synchronously, so callers can fire and forget.
+// A failed call rejects with an Error that has:
+//   .status  HTTP status (0 for network failure or timeout)
+//   .body    parsed JSON reply, if the server sent one (for example {error: "team_only"})
 // Error messages are kept short and never include the API key.
 (function () {
   "use strict";
 
   var cfg = window.LUMEN_CONFIG || {};
   var TIMEOUT_MS = 8000;
-  var RETRIES = 2;
+  var RETRIES = 2; // only for network errors, timeouts and 5xx
 
   // Local-mode simulation of the Telegram handshake (no network, nothing sent).
   var SIM_CONNECT_MS = 4000;
@@ -23,35 +26,38 @@
     return new Promise(function (resolve) { setTimeout(resolve, ms); });
   }
 
-  function shortError(err) {
-    if (!err) return "Unknown error";
-    if (err.name === "AbortError") return "Timed out after 8 s";
-    if (err.status) return "Server replied " + err.status;
-    return "Could not reach the server";
+  function fail(message, status, body) {
+    var err = new Error(message);
+    err.status = status || 0;
+    err.body = body || null;
+    return err;
   }
 
   async function postOnce(body) {
     var ctrl = new AbortController();
     var timer = setTimeout(function () { ctrl.abort(); }, TIMEOUT_MS);
+    var res;
     try {
-      var res = await fetch(cfg.API_URL, {
+      res = await fetch(cfg.API_URL, {
         method: "POST",
         headers: { "content-type": "application/json", "x-api-key": cfg.API_KEY || "" },
         body: JSON.stringify(body),
         signal: ctrl.signal
       });
-      if (!res.ok) {
-        var httpErr = new Error("HTTP " + res.status);
-        httpErr.status = res.status;
-        // 4xx (except timeout / rate limit) will not get better on retry.
-        httpErr.fatal = res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429;
-        throw httpErr;
-      }
-      var text = await res.text();
-      return text ? JSON.parse(text) : {};
+    } catch (err) {
+      throw fail(err && err.name === "AbortError" ? "Timed out after 8 s" : "Could not reach the server", 0);
     } finally {
       clearTimeout(timer);
     }
+    var text = "";
+    try { text = await res.text(); } catch (e) { /* empty body */ }
+    var data = null;
+    if (text) {
+      try { data = JSON.parse(text); } catch (e) { data = null; }
+    }
+    if (!res.ok) throw fail("Server replied " + res.status, res.status, data);
+    if (text && data === null) throw fail("Server reply was not JSON", res.status);
+    return data || {};
   }
 
   async function post(body, retries) {
@@ -62,44 +68,48 @@
         return await postOnce(body);
       } catch (err) {
         lastErr = err;
-        if (err.fatal) break;
+        // 4xx answers (bad request, wrong code, bad key) will not change on retry.
+        var retryable = err.status === 0 || err.status >= 500 || err.status === 429;
+        if (!retryable) break;
         if (attempt < tries) await sleep(700 * (attempt + 1));
       }
     }
-    var out = new Error(shortError(lastErr));
-    out.cause = lastErr;
-    throw out;
+    throw lastErr;
   }
 
   function randomHex(bytes) {
     var arr = new Uint8Array(bytes);
-    (window.crypto || window.msCrypto).getRandomValues(arr);
+    window.crypto.getRandomValues(arr);
     return Array.prototype.map.call(arr, function (b) { return b.toString(16).padStart(2, "0"); }).join("");
   }
 
   window.MendAPI = {
     isLocal: isLocal,
 
-    // Problem event (T1 late delivery / T2 low review). Payload is sent exactly as given.
+    // Problem event (late_delivery / bad_review). `action` is set to the event type.
+    // Resolves to the server reply: {ok:true, sent:true, case_id} or {ok:true, sent:false, reason}.
     sendEvent: function (payload) {
       if (isLocal()) return Promise.resolve({ mode: "local" });
-      return post(payload).then(function (r) { return { mode: "api", response: r }; });
+      var body = Object.assign({ action: payload.event_type }, payload);
+      return post(body);
     },
 
-    // Ask Mend for a one-time /start token. Returns {token, expires_at[, simulated]}.
-    connect: function (customerId, firstName) {
+    // Ask Mend for a one-time /start token. The team code is checked by the server and never stored.
+    // Resolves to {ok, token, expires_at} or {ok, connected:true}. Rejects with status 403 for a wrong code.
+    connect: function (customerId, firstName, teamCode) {
       if (isLocal()) {
         simConnects[customerId] = Date.now();
         return Promise.resolve({
+          ok: true,
           token: "SIMULATED-" + randomHex(3).toUpperCase(),
           expires_at: new Date(Date.now() + 10 * 60000).toISOString(),
           simulated: true
         });
       }
-      return post({ action: "connect", customer_id: customerId, first_name: firstName });
+      return post({ action: "connect", customer_id: customerId, first_name: firstName, team_code: teamCode }, 1);
     },
 
-    // Returns "connected" | "waiting" | "not_connected". No retries: the caller polls.
+    // Resolves to "connected" | "waiting" | "not_connected". No retries: the caller polls.
     status: function (customerId) {
       if (isLocal()) {
         var started = simConnects[customerId];
@@ -107,7 +117,7 @@
         return Promise.resolve(Date.now() - started >= SIM_CONNECT_MS ? "connected" : "waiting");
       }
       return post({ action: "status", customer_id: customerId }, 0).then(function (r) {
-        if (r && (r.connected === true || r.status === "connected")) return "connected";
+        if (r && (r.status === "connected" || r.connected === true)) return "connected";
         if (r && r.status === "waiting") return "waiting";
         return "not_connected";
       });
@@ -125,7 +135,7 @@
       return post({ action: "delete", customer_id: customerId });
     },
 
-    // Last 20 events for the staff view. Resolves to an array.
+    // Recent events for the staff view. Resolves to an array (null in local mode).
     events: function () {
       if (isLocal()) return Promise.resolve(null);
       return post({ action: "events" }, 1).then(function (r) {

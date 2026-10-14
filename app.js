@@ -96,12 +96,6 @@
     window.crypto.getRandomValues(a);
     return Array.prototype.map.call(a, function (b) { return b.toString(16).padStart(2, "0"); }).join("");
   }
-  // Fingerprint of the team code, so a changed TEAM_CODE in config.js invalidates old approvals.
-  function fingerprint(str) {
-    var x = 5381;
-    for (var i = 0; i < str.length; i++) x = ((x << 5) + x + str.charCodeAt(i)) | 0;
-    return "f" + (x >>> 0).toString(36);
-  }
   function prefersReducedMotion() {
     return window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   }
@@ -110,7 +104,7 @@
   function freshState() {
     return {
       v: 2, account: null, cart: [], orders: [], reviews: [], events: [],
-      telegram: { status: "none", team_ok: null }, next_order: 1001, present: false
+      telegram: { status: "none" }, next_order: 1001, present: false
     };
   }
   var storage = null;
@@ -163,7 +157,7 @@
   var shop = { cat: "All", q: "", sort: "featured" };
   var lampOn = false;
   var lampTimer = null;
-  var tg = { simToken: null, fallbackLink: null, error: null, info: null, teamError: null };
+  var tg = {}; // Telegram panel UI: simToken, fallbackLink, error, info, teamError, busy
   var pollTimer = null;
   var pollUntil = 0;
 
@@ -241,10 +235,11 @@
 
   // ---------------------------------------------------------------- account
   function validateName(raw) {
-    var v = String(raw || "").trim().replace(/\s+/g, " ");
+    // Same rule as the Mend server: 1 to 20 letters.
+    var v = String(raw || "").trim();
     if (!v) return { error: "Please enter a first name." };
-    if (v.length > 30) return { error: "Please keep your first name under 30 characters." };
-    if (!/^[\p{L}][\p{L}\p{M}' .-]*$/u.test(v)) return { error: "Please use letters only. Spaces, hyphens and apostrophes are fine." };
+    if (v.length > 20) return { error: "Please keep your first name to 20 letters." };
+    if (!/^\p{L}+$/u.test(v)) return { error: "Please use letters only, as one word (no spaces, numbers or symbols)." };
     return { value: v };
   }
   function signUp(name) {
@@ -259,7 +254,7 @@
   }
   function nameForm(opts) {
     var errId = opts.id + "-error";
-    var input = h("input", { type: "text", id: opts.id, name: "first_name", autocomplete: "given-name", maxlength: 30, required: true, "aria-describedby": opts.id + "-hint" });
+    var input = h("input", { type: "text", id: opts.id, name: "first_name", autocomplete: "given-name", maxlength: 20, required: true, "aria-describedby": opts.id + "-hint" });
     var err = h("p", { class: "error", id: errId, hidden: true });
     var form = h("form", { class: "form-stack", novalidate: true },
       h("div", { class: "field" },
@@ -361,21 +356,37 @@
   }
 
   // ---------------------------------------------------------------- Mend events and feed
+  // Feed status -> plain words. "not_sent" is the old name for not_connected (kept for saved data).
   var STATUS_TEXT = {
     sending: "Sending to Mend…",
-    sent: "Sent to Mend",
+    sent: "Sent to Mend. A Telegram message is on its way.",
     local: "Local mode: recorded here only. Nothing was sent.",
-    not_sent: "Not sent: customer has not connected Telegram",
-    failed: "Not sent: Mend could not be reached"
+    not_connected: "Not sent: the shopper has not connected Telegram.",
+    not_sent: "Not sent: the shopper has not connected Telegram.",
+    open_case: "Held: Mend already has an open case with this customer. One case at a time.",
+    duplicate: "Not sent: this order problem was already reported.",
+    not_problem: "Not a problem, so no message.",
+    other: "Not sent by Mend.",
+    failed: "Could not reach Mend. The order still went through."
   };
-  var STATUS_SHORT = { sending: "Sending", sent: "Sent", local: "Recorded (local mode)", not_sent: "Not sent", failed: "Failed" };
+  var STATUS_SHORT = {
+    sending: "Sending", sent: "Sent", local: "Recorded (local mode)", not_connected: "Not sent", not_sent: "Not sent",
+    open_case: "Held", duplicate: "Not sent", not_problem: "Not sent", other: "Not sent", failed: "Failed"
+  };
   var OUTCOME_TEXT = {
     sending: "Waiting for Mend",
     sent: "Mend will message the customer on Telegram",
     local: "Preview only, no message",
+    not_connected: "No consent yet: Telegram not connected",
     not_sent: "No consent yet: Telegram not connected",
-    failed: "Mend did not answer after 3 tries"
+    open_case: "One open case at a time",
+    duplicate: "Already reported",
+    not_problem: "Not a problem",
+    other: "Mend declined",
+    failed: "Could not reach Mend"
   };
+  // Server reason -> feed status.
+  var REASON_STATUS = { not_connected: "not_connected", open_case: "open_case", duplicate: "duplicate", on_time: "not_problem", review_not_low: "not_problem" };
 
   function logFeed(entry) {
     entry.id = "e_" + randomHex(4);
@@ -418,14 +429,22 @@
     });
 
     // Consent first: nothing leaves the browser unless Telegram is connected.
-    if (!payload.telegram_connected) { settle(entry, "not_sent"); return; }
+    if (!payload.telegram_connected) { settle(entry, "not_connected"); return; }
     if (API.isLocal()) { settle(entry, "local"); return; }
-    API.sendEvent(payload).then(function () {
-      settle(entry, "sent");
+    API.sendEvent(payload).then(function (r) {
+      if (r && r.sent === true) {
+        entry.case_id = r.case_id || null;
+        settle(entry, "sent");
+        return;
+      }
+      var reason = r && r.reason ? String(r.reason) : "";
+      entry.reason = reason;
+      settle(entry, REASON_STATUS[reason] || "other");
+      // The server knows best: the shopper may have typed STOP in Telegram.
+      if (reason === "not_connected" && state.telegram.status === "connected") setTelegram("none");
     }).catch(function (err) {
       entry.error = err.message;
       settle(entry, "failed");
-      logFeed({ kind: "error", title: "Error sending " + order.id + " to Mend", detail: err.message + ". Tried 3 times." });
     });
   }
   function settle(entry, status) {
@@ -461,32 +480,47 @@
   }
 
   // ---------------------------------------------------------------- Telegram
-  function teamCodeSet() { return !!CFG.TEAM_CODE; }
-  function teamApproved() { return teamCodeSet() && state.telegram.team_ok === fingerprint(CFG.TEAM_CODE); }
-  function nameAllowed() {
-    var names = Array.isArray(CFG.TEAM_NAMES) ? CFG.TEAM_NAMES : [];
-    if (!names.length || !state.account) return true;
-    var n = state.account.first_name.toLowerCase();
-    return names.some(function (x) { return String(x).trim().toLowerCase() === n; });
-  }
+  var WRONG_CODE = "That code is not right. Telegram messages are only enabled for the demo team.";
+
   function setTelegram(status) {
     state.telegram.status = status;
     save();
+    accountChanged();
+  }
+  function accountChanged() {
     var r = parseRoute();
     if (r && r.parts[0] === "account") keepFocus(function () { render(false); });
   }
-  function connectTelegram() {
-    if (!state.account || !teamApproved() || !nameAllowed()) return;
+  // The team code is checked by the Mend server. It is passed straight through and never stored.
+  function connectTelegram(teamCode) {
+    if (!state.account || tg.busy) return;
+    var code = String(teamCode || "").trim();
+    if (!code) {
+      tg = { teamError: "Please enter the team code." };
+      accountChanged();
+      focusTeamCode();
+      return;
+    }
     var local = API.isLocal();
-    tg = { simToken: null, fallbackLink: null, error: null, info: null, teamError: null };
+    tg = { busy: true };
     // Open the tab now, while we still have the click, so pop-up blockers allow it.
     var win = null;
     if (!local) {
       try { win = window.open("about:blank", "_blank"); } catch (e) { win = null; }
     }
-    setTelegram("waiting");
-    API.connect(state.account.customer_id, state.account.first_name).then(function (res) {
+    function closeWin() { if (win) { try { win.close(); } catch (e) { /* ignore */ } } }
+    accountChanged();
+    API.connect(state.account.customer_id, state.account.first_name, code).then(function (res) {
+      if (res && res.connected === true) {
+        closeWin();
+        tg = {};
+        logFeed({ kind: "connect", title: "Telegram connected", detail: state.account.first_name + " was already connected" });
+        setTelegram("connected");
+        toast("Telegram is connected.");
+        return;
+      }
       if (!res || !res.token) throw new Error("Mend did not send a link");
+      tg = {};
       if (local) {
         tg.simToken = res.token;
       } else {
@@ -502,11 +536,21 @@
       startPolling();
       setTelegram("waiting");
     }).catch(function (err) {
-      if (win) { try { win.close(); } catch (e) { /* ignore */ } }
-      tg.error = "We couldn't get a Telegram link: " + err.message + ". Please try again.";
-      logFeed({ kind: "error", title: "Telegram connect failed", detail: err.message });
+      closeWin();
+      if (err.status === 403) {
+        tg = { teamError: WRONG_CODE };
+        logFeed({ kind: "info", title: "Telegram: team code refused", detail: "Only the demo team can connect" });
+      } else {
+        tg = { error: "Could not reach Mend, so Telegram is not connected. Please try again." };
+        logFeed({ kind: "error", title: "Telegram connect failed", detail: err.message });
+      }
       setTelegram("none");
+      if (tg.teamError) focusTeamCode();
     });
+  }
+  function focusTeamCode() {
+    var inp = document.getElementById("team-code");
+    if (inp) inp.focus();
   }
   function startPolling() {
     stopPolling();
@@ -1170,58 +1214,9 @@
       return panel;
     }
 
-    if (!teamCodeSet()) {
-      panel.appendChild(h("div", { class: "note note--plain" },
-        h("p", null, "Telegram messages are only enabled for the demo team."),
-        h("p", { class: "small muted" }, "No team code is set in config.js yet, so connecting is switched off.")));
-      panel.appendChild(h("button", { type: "button", class: "btn", disabled: true }, "Connect Telegram"));
-      return panel;
-    }
-
-    if (!teamApproved()) {
-      var codeInput = h("input", { type: "password", id: "team-code", autocomplete: "off", "aria-describedby": "team-hint" + (tg.teamError ? " team-error" : "") });
-      var form = h("form", { class: "form-stack", novalidate: true },
-        h("div", { class: "field" },
-          h("label", { for: "team-code" }, "Team code"),
-          codeInput,
-          h("p", { class: "hint", id: "team-hint" }, "Telegram messages are only enabled for the demo team."),
-          tg.teamError ? h("p", { class: "error", id: "team-error" }, tg.teamError) : null),
-        h("div", { class: "btn-row" },
-          h("button", { type: "submit", class: "btn btn--ghost" }, "Check code"),
-          h("button", { type: "button", class: "btn", disabled: true }, "Connect Telegram")));
-      form.addEventListener("submit", function (e) {
-        e.preventDefault();
-        if (codeInput.value.trim() && codeInput.value.trim() === CFG.TEAM_CODE) {
-          state.telegram.team_ok = fingerprint(CFG.TEAM_CODE);
-          tg.teamError = null;
-          save();
-          toast("Team code accepted.");
-          keepFocus(function () { render(false); });
-          var btn = document.querySelector("[data-key='tg-connect']");
-          if (btn) btn.focus();
-        } else {
-          tg.teamError = "That code doesn't match. Telegram messages are only enabled for the demo team.";
-          render(false);
-          var inp = document.getElementById("team-code");
-          if (inp) inp.focus();
-        }
-      });
-      panel.appendChild(form);
-      return panel;
-    }
-
-    if (!nameAllowed()) {
-      panel.appendChild(h("div", { class: "note note--plain" },
-        h("p", null, "Telegram messages are only enabled for the demo team."),
-        h("p", { class: "small muted" }, "This first name is not on the team list in config.js.")));
-      panel.appendChild(h("button", { type: "button", class: "btn", disabled: true }, "Connect Telegram"));
-      return panel;
-    }
-
-    panel.appendChild(h("p", { class: "badge", style: { marginBottom: "1rem" } }, icon("check"), "Team code accepted"));
     if (local) {
       panel.appendChild(h("div", { class: "note" },
-        h("p", null, h("strong", null, "Local mode."), " No API is set in config.js, so connecting is simulated and no message will be sent.")));
+        h("p", null, h("strong", null, "Local mode."), " No API is set in config.js, so connecting is simulated, the code is not checked, and no message will be sent.")));
     }
     if (st === "waiting") {
       if (tg.simToken) {
@@ -1245,7 +1240,30 @@
     }
     if (tg.error) panel.appendChild(h("p", { class: "error", role: "alert" }, tg.error));
     if (tg.info) panel.appendChild(h("p", { class: "note note--plain" }, tg.info));
-    panel.appendChild(h("button", { type: "button", class: "btn", "data-key": "tg-connect", onclick: connectTelegram }, "Connect Telegram"));
+
+    // The code goes straight to the server with the connect request. It is never saved.
+    var described = "team-hint" + (tg.teamError ? " team-error" : "");
+    var codeInput = h("input", {
+      type: "password", id: "team-code", name: "team_code", autocomplete: "off", spellcheck: "false",
+      "aria-describedby": described, "aria-invalid": tg.teamError ? "true" : null, disabled: tg.busy
+    });
+    var connectBtn = h("button", { type: "submit", class: "btn", "data-key": "tg-connect", disabled: true },
+      tg.busy ? "Checking code…" : "Connect Telegram");
+    codeInput.addEventListener("input", function () { connectBtn.disabled = !codeInput.value.trim(); });
+    var form = h("form", { class: "form-stack", novalidate: true },
+      h("div", { class: "field" },
+        h("label", { for: "team-code" }, "Team code"),
+        codeInput,
+        h("p", { class: "hint", id: "team-hint" }, "Telegram messages are only enabled for the demo team. Mend checks the code."),
+        tg.teamError ? h("p", { class: "error", id: "team-error", role: "alert" }, tg.teamError) : null),
+      h("div", { class: "btn-row" }, connectBtn));
+    form.addEventListener("submit", function (e) {
+      e.preventDefault();
+      var code = codeInput.value;
+      codeInput.value = "";
+      connectTelegram(code);
+    });
+    panel.appendChild(form);
     panel.appendChild(h("p", { class: "small muted", style: { marginTop: ".75rem" } },
       local ? "Nothing leaves this browser in local mode." : "This opens Mend's bot in Telegram with a one-time link."));
     return panel;
@@ -1316,25 +1334,45 @@
 
     function localRows() {
       return state.events.filter(function (e) { return e.event_type; }).slice(0, 20).map(function (e) {
-        return { time: e.ts, event_type: e.event_type, first_name: e.first_name, order_id: e.order_id, status: STATUS_SHORT[e.status] || e.status, outcome: e.error ? "Error: " + e.error : OUTCOME_TEXT[e.status] || "" };
+        var outcome = e.error ? "Error: " + e.error : OUTCOME_TEXT[e.status] || "";
+        if (e.status === "other" && e.reason) outcome += " (" + e.reason + ")";
+        return {
+          at: e.ts, event_type: e.event_type, first_name: e.first_name, order_id: e.order_id,
+          product_name: e.payload ? e.payload.product_name : "", status: STATUS_SHORT[e.status] || e.status, outcome: outcome
+        };
       });
     }
+    function timeOf(r) { return r.at || r.time || r.ts || ""; }
+    // Server codes -> plain words. Free text from the server is shown as it is.
+    var PLAIN = {
+      sent: "Sent", not_sent: "Not sent", held: "Held", failed: "Failed", error: "Error",
+      not_connected: "Telegram not connected", open_case: "Open case already", duplicate: "Already reported",
+      on_time: "Not a problem", review_not_low: "Not a problem"
+    };
+    function plain(v) {
+      var s = String(v == null ? "" : v);
+      if (PLAIN[s]) return PLAIN[s];
+      return /^[a-z]+(_[a-z]+)+$/.test(s) ? s.charAt(0).toUpperCase() + s.slice(1).replace(/_/g, " ") : s;
+    }
+    // Only these fields are shown. Anything else the server sends (ids, tokens) is ignored.
     function draw(rows) {
       if (!rows.length) { tableHolder.replaceChildren(h("p", { class: "muted" }, "No events yet. Deliver an order late or publish a 1 or 2 star review.")); return; }
+      rows = rows.slice().sort(function (a, b) { return String(timeOf(b)).localeCompare(String(timeOf(a))); });
       tableHolder.replaceChildren(h("div", { class: "table-wrap" },
         h("table", null,
           h("caption", { class: "visually-hidden" }, "Recent Mend events, newest first"),
-          h("thead", null, h("tr", null, ["Time", "Event type", "First name", "Order id", "Status", "Outcome"].map(function (c) { return h("th", { scope: "col" }, c); }))),
+          h("thead", null, h("tr", null, ["Time", "Event type", "First name", "Order id", "Product", "Status", "Outcome"].map(function (c) { return h("th", { scope: "col" }, c); }))),
           h("tbody", null, rows.map(function (r) {
-            var t = r.time || r.ts || r.created_at || "";
+            var t = timeOf(r);
             var d = t ? new Date(t) : null;
             return h("tr", null,
               h("td", { class: "num" }, d && !isNaN(d) ? dateText(t) + ", " + timeText(t) : String(t)),
               h("td", null, r.event_type === "late_delivery" ? "Late delivery" : r.event_type === "bad_review" ? "Low review" : String(r.event_type || "")),
               h("td", null, String(r.first_name || "")),
               h("td", null, String(r.order_id || "")),
-              h("td", null, String(r.status || "")),
-              h("td", null, String(r.outcome || "")));
+              h("td", null, String(r.product_name || "")),
+              h("td", null, plain(r.status)),
+              h("td", null, plain(r.outcome)));
           })))));
     }
     if (local) {
@@ -1343,7 +1381,7 @@
       draw([]);
       tableHolder.replaceChildren(h("p", { class: "muted" }, "Loading events…"));
       API.events().then(function (rows) {
-        source.textContent = "Source: Mend API, last 20 events.";
+        source.textContent = "Source: Mend API, most recent events.";
         draw(rows.slice(0, 20));
       }).catch(function (err) {
         source.textContent = "Could not load from the Mend API (" + err.message + "). Showing this browser's feed instead.";
@@ -1477,6 +1515,14 @@
     if (loadNote) { logFeed({ kind: "error", title: "Saved data was reset", detail: loadNote }); toast(loadNote); }
     if (state.telegram.status === "waiting") {
       if (API.isLocal()) setTelegram("none"); else startPolling();
+    } else if (state.telegram.status === "connected" && state.account && !API.isLocal()) {
+      // The shopper may have typed STOP in Telegram since the last visit.
+      API.status(state.account.customer_id).then(function (st) {
+        if (st === "not_connected" && state.telegram.status === "connected") {
+          logFeed({ kind: "info", title: "Telegram is no longer connected", detail: "Mend reports the shopper stopped messages" });
+          setTelegram("none");
+        }
+      }).catch(function () { /* offline: keep the saved status */ });
     }
   }
 

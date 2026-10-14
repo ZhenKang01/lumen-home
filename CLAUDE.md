@@ -5,17 +5,20 @@ Fictional home-goods demo store for the Mend hackathon. Plain HTML/CSS/JS. It mu
 ## Files
 - `index.html`: page shell (demo bar, header, footer, dialogs, hero lamp `<template>`).
 - `styles.css`: all styles. Light tokens on `:root`, dark via `prefers-color-scheme`, `html.present` = present mode.
-- `config.js`: `window.LUMEN_CONFIG` (API_URL empty = local mode; TEAM_CODE empty = nobody can connect).
+- `config.js`: `window.LUMEN_CONFIG`. API_URL is the live n8n webhook (empty = local mode). TEAM_CODE / TEAM_NAMES are unused and stay empty: the server checks the team code.
 - `data.js`: 18 products (`window.LUMEN_PRODUCTS`), 3 per category, seeded reviews `[name, rating, text, daysAgo]`.
-- `api.js`: `window.MendAPI` adapter (POST, x-api-key, 8 s timeout, 2 retries; local-mode simulation).
+- `api.js`: `window.MendAPI` adapter (POST, x-api-key, 8 s timeout, retries only for network/5xx; errors carry `.status` and `.body`; local-mode simulation).
 - `app.js`: state (`localStorage` key `lumen_store_v2`), hash router, views, demo drawer, events, Telegram flow.
-- `mock-api.js`: Node mock of the Mend API for testing. Validates the event payload strictly.
+- `mock-api.js`: Node mock of the Mend backend (team-code 403, connect/status/stop/delete/events, event replies sent / not_connected / open_case / duplicate / on_time / review_not_low). Team code comes from `MOCK_TEAM_CODE`.
 - `tests/e2e.js`: Playwright end-to-end test and screenshots (`node tests/e2e.js . shots`).
 
 ## Rules
 - Never use `innerHTML` / `outerHTML` / `insertAdjacentHTML`. Build DOM with `h()` (text nodes) and `icon()` / `svgEl()`.
 - Only a first name is collected. No email, phone, address or card fields.
-- Event payload fields are fixed (README, "API contract"). Don't add or rename fields; `mock-api.js` rejects extras.
+- Event body = first-prompt payload + `action` (= event_type). Don't add or rename fields; `mock-api.js` rejects extras.
+- Server formats: customer_id `^c_[a-z0-9]{4,24}$`, first_name 1-20 letters, order_id `LH-` + 3-8 digits.
+- The team code is typed on the Account page and sent only with `connect`. Never store it, put it in config, print it, or log it.
+- Tests must never call the live n8n webhook; `tests/e2e.js` blocks it and asserts zero hits.
 - Send events only when Telegram is connected (consent first). Otherwise log "Not sent: customer has not connected Telegram".
 - Never display tokens (after use), chat ids or the API key.
 - Preview messages must never mention discounts or vouchers. Refunds are limited to the delivery fee.

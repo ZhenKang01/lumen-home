@@ -448,8 +448,9 @@ dialog::backdrop { background: var(--backdrop); }
 .feed__meta { font-size: .82rem; color: var(--slate); margin: 0; }
 .feed__status { font-size: .85rem; margin: .15rem 0 0; font-weight: 600; }
 .feed__status--sent { color: var(--moss); }
-.feed__status--failed, .feed__status--not_sent { color: var(--late); }
-.feed__status--local, .feed__status--sending { color: var(--slate); }
+.feed__status--failed, .feed__status--not_sent, .feed__status--not_connected { color: var(--late); }
+.feed__status--open_case { color: var(--glow-ink); }
+.feed__status--local, .feed__status--sending, .feed__status--duplicate, .feed__status--not_problem, .feed__status--other { color: var(--slate); }
 .feed__body { grid-column: 2; }
 .feed .link-btn { font-size: .88rem; font-weight: 600; }
 

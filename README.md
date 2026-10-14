@@ -32,26 +32,29 @@ The app uses hash URLs (`#/orders`), so no redirect rules are needed on either h
 window.LUMEN_CONFIG = {
   DELIVERY_FEE: 6.9, PROMISE_DAYS: 5,
   BOT_URL: "https://t.me/mend_by_smc_bot",
-  API_URL: "", API_KEY: "",
+  API_URL: "https://smc1.app.n8n.cloud/webhook/mend-store", API_KEY: "lh_9a754c53c17d4ff09b2b03f2",
   TEAM_CODE: "", TEAM_NAMES: []
 };
 ```
 
 | Setting | What it does |
 | --- | --- |
-| `API_URL` | Your Mend API endpoint. **Empty = local mode:** events go into the demo feed only and nothing is sent anywhere. |
+| `API_URL` | The Mend backend (an n8n webhook). **Empty = local mode:** events go into the demo feed only and nothing is sent anywhere. |
 | `API_KEY` | Sent as the `x-api-key` header on every request. Never shown in the UI and never put in a URL. |
-| `TEAM_CODE` | Code your team types in *Account* to unlock **Connect Telegram**. **Empty = nobody can connect.** |
-| `TEAM_NAMES` | Optional. If you list first names (for example `["Mei", "Arjun"]`), only accounts with those names can connect. Leave `[]` to allow anyone who knows the code. |
+| `TEAM_CODE`, `TEAM_NAMES` | **Not used any more. Leave them empty.** The Mend server checks the team code, so the store has no code of its own. |
 | `BOT_URL` | Mend's Telegram bot. The connect link is `BOT_URL?start=<token>`. |
 | `DELIVERY_FEE`, `PROMISE_DAYS` | S$6.90 delivery, and orders promised 5 days after they are placed. |
+
+> **About `API_KEY`:** anyone who views the page source can see it. It is only a basic filter against random traffic, not security. The real protection is on the server: Mend refuses to connect Telegram without the team code, and only sends messages to people who connected.
+
+> **Where it works:** the Mend backend only accepts requests from `https://zhenkang01.github.io`. The hosted site works. A copy opened from disk or `localhost` with this `API_URL` will show "Could not reach Mend". To try the store offline, set `API_URL: ""` (local mode), or point it at the mock server below.
 
 ## The demo, step by step
 
 The **Quick start for judges** button in the top bar shows these steps on screen.
 
 1. **Account:** enter a first name. A random customer id like `c_9f3a2b` is created once and kept.
-2. **Connect Telegram:** enter the team code, then press *Connect Telegram* and tap *Start* in the bot. The status changes from *Not connected* to *Waiting* to *Connected*.
+2. **Connect Telegram:** type the team code in *Account* and press *Connect Telegram*. Mend checks the code; if it is right, Telegram opens in a new tab. Tap *Start* in the bot. The status changes from *Not connected* to *Waiting for Telegram* to *Connected*. The code is sent once with the request and never saved in the browser.
 3. **Order:** add items to the basket and place the order. It shows as *On its way*.
 4. **Demo controls** (button at the bottom left): choose *Deliver on time*, *Deliver 2 days late* or *Deliver 9 days late*. A late delivery sends a `late_delivery` event to Mend.
 5. **Review:** after delivery, each item in the order gets a *Review* button. A review of 2 stars or lower sends a `bad_review` event.
@@ -61,17 +64,38 @@ The Demo controls drawer also has the activity feed (last 8 events), the `/fastf
 
 ## API contract
 
-Every call is a `POST` of JSON to `API_URL` with headers `content-type: application/json` and `x-api-key: <API_KEY>`. Each call has an 8 second timeout and up to 2 retries, and never blocks the UI. Your API must allow CORS from the site's origin, including the `x-api-key` header. Opening `index.html` from disk sends `Origin: null`.
+Every call is a `POST` of JSON to `API_URL` with headers `content-type: application/json` and `x-api-key: <API_KEY>`. Each call has an 8 second timeout and never blocks the UI. Network errors, timeouts and 5xx answers are retried up to 2 times; 4xx answers are not retried. The API must allow CORS from the site's origin, including the `x-api-key` header.
 
-### Problem events (sent as-is, no `action` field)
+Formats the server accepts (the store keeps to them):
+- `customer_id`: `^c_[a-z0-9]{4,24}$` (the store makes `c_` + 6 hex characters)
+- `first_name`: 1 to 20 letters (the sign-up form enforces this: one word, letters only)
+- `order_id`: `LH-` plus 3 to 8 digits
+- `category`: one of Lighting, Furniture, Kitchen, Textiles, Decor, Storage
+
+### Actions
+
+| Request body | Reply and what the store does |
+| --- | --- |
+| `{"action":"connect","customer_id","first_name","team_code"}` | `200 {"ok":true,"token","expires_at"}`: opens `BOT_URL?start=<token>` in a new tab and shows *Waiting for Telegram*. `200 {"ok":true,"connected":true}`: shows *Connected* straight away. `403 {"error":"team_only"}`: shows "That code is not right. Telegram messages are only enabled for the demo team." |
+| `{"action":"status","customer_id"}` | `{"ok":true,"status":"connected" / "waiting" / "not_connected"}`. Polled every 3 s for up to 2 minutes after the link opens; stops when connected. Also checked once on page load, so a STOP typed in Telegram is noticed. |
+| `{"action":"stop","customer_id"}` | Sent by *Disconnect and stop messages*. |
+| `{"action":"delete","customer_id"}` | Sent by *Delete my data*. |
+| `{"action":"events"}` | `{"ok":true,"events":[{"at","event_type","first_name","order_id","product_name","status","outcome"}, ...]}`. Shown newest first in `#/staff`. Only these fields are shown; chat ids and tokens never are. |
+
+The team code is typed into the Account page, sent with `connect`, and then cleared from the box. It is not stored and not in `config.js`. The token appears only inside the Telegram link.
+
+### Problem events
 
 Two triggers only:
 - **T1 late delivery**: delivered with `days_late >= 1`.
 - **T2 low review**: review rating `<= 2`.
 
+The body is the event payload with `action` set to the event type (`event_type` is kept too):
+
 ```json
 {
-  "event_type": "late_delivery | bad_review",
+  "action": "late_delivery",
+  "event_type": "late_delivery",
   "customer_id": "c_9f3a2b",
   "first_name": "Mei",
   "order_id": "LH-1001",
@@ -91,37 +115,37 @@ Two triggers only:
 ```
 
 - `order_value` is the order total including the delivery fee.
-- For `late_delivery`, `product_*` is the order's highest-priced item.
+- For `late_delivery`, `product_*` is the order's highest-priced item and `review_score` is `null`.
 - For `bad_review`, `review_score` and `review_text` are filled in, and `days_late` is that order's value (0 if it arrived on time).
 - `promised_at` is midnight UTC, 5 days after the order date. `delivered_at` is `promised_at` plus `days_late`.
-- **Consent first:** if the shopper has not connected Telegram, nothing is sent. The feed shows "Not sent: customer has not connected Telegram".
+- **Consent first:** the store only sends an event when the saved Telegram status is *Connected*. The server checks again.
 
-### Actions
+Replies are shown in the Demo controls activity feed in plain words:
 
-| Request body | Expected reply |
+| Reply | Feed message |
 | --- | --- |
-| `{"action":"connect","customer_id","first_name"}` | `{"token":"…","expires_at":"ISO date"}`. The shop opens `BOT_URL?start=<token>` in a new tab. |
-| `{"action":"status","customer_id"}` | `{"status":"not_connected" \| "waiting" \| "connected"}` (or `{"connected":true}`). Polled every 3 s for up to 2 minutes. |
-| `{"action":"stop","customer_id"}` | `{"ok":true}`. Sent by *Disconnect and stop messages*. |
-| `{"action":"delete","customer_id"}` | `{"ok":true}`. Sent by *Delete my data*. |
-| `{"action":"events"}` | `{"events":[{"time","event_type","first_name","order_id","status","outcome"}, …]}`, the last 20, for `#/staff`. |
+| `{"ok":true,"sent":true,"case_id"}` | Sent to Mend. A Telegram message is on its way. |
+| `{"sent":false,"reason":"not_connected"}` (or not connected in the store) | Not sent: the shopper has not connected Telegram. The store also switches its status to *Not connected*. |
+| `{"sent":false,"reason":"open_case"}` | Held: Mend already has an open case with this customer. One case at a time. |
+| `{"sent":false,"reason":"duplicate"}` | Not sent: this order problem was already reported. |
+| `{"sent":false,"reason":"on_time"}` or `"review_not_low"` | Not a problem, so no message. |
+| HTTP 400, other errors, network failure or timeout | Could not reach Mend. The order still went through. |
 
-The token appears only inside the Telegram link. Chat ids, tokens and API keys are never shown on the page. In local mode the shop shows a clearly labelled **simulated** token and fakes a successful connection after about 4 seconds, and nothing is sent.
+In local mode the store shows a clearly labelled **simulated** token, does not check the code, fakes a successful connection after about 4 seconds, and sends nothing.
 
 ### Test with the mock API
 
-`mock-api.js` is a small Node server (no dependencies) that implements the contract above. It rejects any event whose fields don't match exactly.
+`mock-api.js` is a small Node server (no dependencies) that copies the backend: the team-code check (403), connect, status, stop, delete, events, and every event reply (`sent`, `not_connected`, `open_case`, `duplicate`, `on_time`, `review_not_low`). It rejects bodies that don't match the formats above with HTTP 400.
 
 ```bash
-node mock-api.js                 # http://localhost:8787, key "test-key"
-MOCK_FAIL=1 node mock-api.js     # every event gets HTTP 500, to test retries and errors
+MOCK_TEAM_CODE=choose-a-test-code node mock-api.js   # http://localhost:8787, key "test-key"
 ```
 
-Then set `API_URL: "http://localhost:8787"`, `API_KEY: "test-key"` and any `TEAM_CODE` in `config.js`. The mock pretends the customer pressed *Start* in Telegram 5 seconds after asking for a link. `GET http://localhost:8787/__inspect` shows what it received.
+Then, in a local copy of `config.js`, set `API_URL: "http://localhost:8787"` and `API_KEY: "test-key"`, and type your test code on the Account page. The mock pretends the shopper pressed *Start* in Telegram 5 seconds after asking for a link. To see `duplicate`, use *Reset demo* (order numbers restart at LH-1001) and make the same order late again. `GET http://localhost:8787/__inspect` shows what it received; the team code is never logged.
 
 ### Automated browser test
 
-`tests/e2e.js` runs the whole flow in Chromium with Playwright. It covers local mode, API mode against the mock, a failing API, 360/768/1280 widths, dark mode, reduced motion, blocked storage and corrupt storage. It saves screenshots and fails on any console error.
+`tests/e2e.js` runs the whole flow in Chromium with Playwright. It covers local mode, API mode against the mock (wrong code, waiting, connected, and every feed message, including 400 and network failure), the shipped config with all calls to the live backend blocked, 360/768/1280 widths, dark mode, reduced motion, blocked storage and corrupt storage. It saves screenshots and fails on any console error.
 
 ```bash
 npm install --no-save playwright && npx playwright install chromium
@@ -148,8 +172,8 @@ Never link to images on other sites. Always keep a local copy.
 
 ## Known limits
 
-- **The team code check runs in the browser.** Anyone who reads `config.js` can see `TEAM_CODE`. That is fine for a demo, but it is not security. The real protection must be on the API side.
-- `API_KEY` is also visible to anyone who opens `config.js`. Use a demo-only key with narrow permissions, and rate-limit it on the server.
+- `API_KEY` is visible to anyone who views the page source. It is only a basic filter. The real protection is that the server refuses to connect Telegram without the team code, and only sends messages to people who connected.
+- The backend only accepts requests from the GitHub Pages site. Local copies need local mode or the mock.
 - Data lives in this browser's `localStorage` (key `lumen_store_v2`). Another browser or device is a different shopper. If storage is blocked, the shop still works but forgets everything when the tab closes. If saved data is corrupt, it is reset.
 - Delivery dates are simulated: *Deliver 9 days late* sets the delivery date in the future relative to today.
 - Ratings and reviews are fictional, and the shop never shows impact numbers.
