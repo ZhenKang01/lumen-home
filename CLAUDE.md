@@ -19,6 +19,8 @@ Fictional home-goods demo store for the Mend hackathon. Plain HTML/CSS/JS. It mu
 - Server formats: customer_id `^c_[a-z0-9]{4,24}$`, first_name 1-20 letters, order_id `LH-` + 3-8 digits.
 - The team code is typed on the Account page and sent only with `connect`. Never store it, put it in config, print it, or log it.
 - Tests must never call the live n8n webhook; `tests/e2e.js` blocks it and asserts zero hits.
+- Free-delivery voucher: the server issues and enforces it. The store caches it in `state.voucher`, shows it, and calls `redeem` exactly once when an order is placed with "Use my voucher" ticked. An order always goes through; only the fee depends on the voucher. Local mode simulates it.
+- Previews may not mention discounts or vouchers. The refund offer appears only when an order is 3+ days late and a fee was paid.
 - Send events only when Telegram is connected (consent first). Otherwise log "Not sent: customer has not connected Telegram".
 - Never display tokens (after use), chat ids or the API key.
 - Preview messages must never mention discounts or vouchers. Refunds are limited to the delivery fee.

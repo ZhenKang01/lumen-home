@@ -76,11 +76,28 @@ async function blockLive(ctx) {
   await ctx.route(LIVE_HOST, r => { hits.push(r.request().url()); return r.abort(); });
   return hits;
 }
+// Newest feed entry that carries a send status (voucher notes have none).
 async function firstFeedText(page) {
   await page.click("#demo-tab");
   await page.waitForSelector("#demo-drawer[open] .feed li");
-  const t = await page.locator(".feed li").first().textContent();
+  const t = await page.locator(".feed li:has(.feed__status)").first().textContent();
   return t;
+}
+async function allFeedText(page) {
+  await page.click("#demo-tab");
+  await page.waitForSelector("#demo-drawer[open] .feed li");
+  const t = await page.locator(".feed").textContent();
+  if (await page.locator("#demo-drawer[open]").count()) await page.keyboard.press("Escape");
+  return t;
+}
+// Basket summary numbers: {del, ins, total, voucherLine}
+async function basketNumbers(page) {
+  return page.evaluate(() => ({
+    del: (document.querySelector(".summary del") || {}).textContent || null,
+    ins: (document.querySelector(".summary ins") || {}).textContent || null,
+    total: document.querySelector(".summary dd.total").textContent,
+    voucherLine: (document.querySelector(".voucher-line__title") || {}).textContent || null
+  }));
 }
 async function closeDrawer(page) {
   if (await page.locator("#demo-drawer[open]").count()) await page.keyboard.press("Escape");
@@ -175,6 +192,30 @@ async function closeDrawer(page) {
       await page.keyboard.press("Escape");
       await closeDrawer(page);
 
+      // Local voucher simulation: issued on the late delivery, applied in the basket, cleared when used.
+      let feedAll = await allFeedText(page);
+      check("local: voucher issued note in feed", /Mend issued a free-delivery voucher \(valid until \d{1,2} \w{3}\)\./.test(feedAll), feedAll);
+      await page.goto("http://localhost:5173/#/account");
+      check("local: account shows voucher", await page.locator("[data-voucher='active']").isVisible() && /^FD-[A-Z0-9]{6}$/.test(await page.locator(".voucher-card__code").textContent()));
+      check("local: voucher says free delivery up to S$6.90 and 30 days left", (await page.locator(".voucher-card").textContent()).includes("Free delivery up to S$6.90") && (await page.locator(".voucher-card").textContent()).includes("30 days left"));
+      await page.goto("http://localhost:5173/#/p/pantry-jars");
+      await page.click(".product button:has-text('Add to basket')");
+      await page.goto("http://localhost:5173/#/cart");
+      let bn = await basketNumbers(page);
+      check("local basket: voucher applied, S$6.90 struck, S$0.00 delivery, total = items", bn.voucherLine && bn.voucherLine.startsWith("Free-delivery voucher FD-") && bn.del.includes("S$6.90") && bn.ins.includes("S$0.00") && bn.total === "S$34.00", bn);
+      await page.uncheck("input[data-key='use-voucher']");
+      bn = await basketNumbers(page);
+      check("local basket: unticked -> items + 6.90", bn.total === "S$40.90" && bn.del === null, bn);
+      await page.check("input[data-key='use-voucher']");
+      check("local basket: re-ticked -> items + 0.00", (await basketNumbers(page)).total === "S$34.00");
+      await page.click("button[data-key='place-order']");
+      await page.waitForSelector("h2:has-text('Order LH-1002')");
+      check("local: order shows Free delivery (voucher) and total S$34.00", (await page.locator(".order").first().textContent()).includes("Free delivery (voucher)") && (await page.locator(".order__total").first().textContent()).includes("S$34.00"));
+      feedAll = await allFeedText(page);
+      check("local: voucher used note in feed", feedAll.includes("Voucher used on order LH-1002. This is a repeat purchase prompted by Mend."), feedAll);
+      await page.goto("http://localhost:5173/#/account");
+      check("local: voucher gone after use", await page.getByText("No voucher. If an order arrives late, Mend adds one here.").isVisible());
+
       await page.goto("http://localhost:5173/#/p/halo-lamp/review");
       await page.click("label[for='star-1']");
       await page.fill("#review-text", "Arrived very late and the box was <b>crushed</b>.");
@@ -189,9 +230,9 @@ async function closeDrawer(page) {
       await page.click(".product button:has-text('Add to basket')");
       await page.goto("http://localhost:5173/#/cart");
       await page.click("text=Place order");
-      await page.waitForSelector("h2:has-text('Order LH-1002')");
+      await page.waitForSelector("h2:has-text('Order LH-1003')");
       await page.click("#demo-tab");
-      await page.click("button[data-key='dl-LH-1002-2']");
+      await page.click("button[data-key='dl-LH-1003-2']");
       const f2 = await firstFeedText(page);
       check("local: not connected -> plain 'Not sent' message", f2.includes(T.notConnected), f2);
       await closeDrawer(page);
@@ -316,14 +357,72 @@ async function closeDrawer(page) {
       check("late payload values", late && late.action === "late_delivery" && late.event_type === "late_delivery" && /^c_[a-z0-9]{4,24}$/.test(late.customer_id) &&
         late.product_id === "halo-lamp" && late.order_value === 163.9 && late.days_late === 9 && late.review_score === null && late.prior_orders === 0, late);
       console.log("  late body:", JSON.stringify(late));
+      const cid = late.customer_id;
 
-      // 2) held (open case)
-      await order(["mug-set"], "LH-1002");
-      await deliverLate("LH-1002", 2);
+      // Voucher present: the late reply carried it
+      let feedAll = await allFeedText(page);
+      check("feed: voucher issued note", /Mend issued a free-delivery voucher \(valid until \d{1,2} \w{3}\)\./.test(feedAll), feedAll);
+      const mockVoucher = inspect.vouchers[cid];
+      await page.goto("http://localhost:5174/#/account");
+      await page.waitForSelector("[data-voucher='active']");
+      check("account shows the voucher Mend issued", (await page.locator(".voucher-card__code").textContent()) === mockVoucher.code);
+      check("account voucher: free delivery, valid until, days left", /Free delivery up to S\$6\.90Valid until \d{1,2} \w{3} · 30 days left/.test(await page.locator(".voucher-card").textContent()), await page.locator(".voucher-card").textContent());
+      await shot(page, "api-09-account-voucher");
+      await page.click("#demo-tab");
+      check("drawer voucher status: active", (await page.locator("[data-voucher-status]").getAttribute("data-voucher-status")) === "active");
+      await closeDrawer(page);
+
+      // Basket totals with and without the voucher
+      await page.goto("http://localhost:5174/#/p/pantry-jars");
+      await page.click(".product button:has-text('Add to basket')");
+      await page.goto("http://localhost:5174/#/cart");
+      let bn = await basketNumbers(page);
+      check("basket: voucher line names the code", bn.voucherLine === "Free-delivery voucher " + mockVoucher.code, bn);
+      check("basket: S$6.90 struck through, S$0.00 delivery, total = items (S$34.00)", bn.del.includes("S$6.90") && bn.ins.includes("S$0.00") && bn.total === "S$34.00", bn);
+      check("basket: 'Use my voucher' ticked by default", await page.isChecked("input[data-key='use-voucher']"));
+      await shot(page, "api-10-basket-voucher");
+      await page.uncheck("input[data-key='use-voucher']");
+      bn = await basketNumbers(page);
+      check("basket: unticked -> items + S$6.90 (S$40.90)", bn.total === "S$40.90" && bn.del === null, bn);
+      await shot(page, "api-10b-basket-voucher-unticked");
+      await page.check("input[data-key='use-voucher']");
+
+      // Redeem ok
+      await page.click("button[data-key='place-order']");
+      await page.waitForSelector("h2:has-text('Order LH-1002')");
+      const card = await page.locator(".order").first().textContent();
+      check("order shows Free delivery (voucher), total S$34.00", card.includes("Free delivery (voucher)") && card.includes("S$34.00"), card);
+      inspect = await getJSON(MOCK + "/__inspect");
+      const redeems = inspect.actions.filter(a => a.action === "redeem");
+      check("redeem called once, with the order id", redeems.length === 1 && redeems[0].order_id === "LH-1002" && redeems[0].customer_id === cid, redeems);
+      check("mock marked the voucher used on LH-1002", inspect.vouchers[cid].used_on === "LH-1002");
+      await shot(page, "api-11-order-voucher");
+      feedAll = await allFeedText(page);
+      check("feed: voucher used note", feedAll.includes("Voucher used on order LH-1002. This is a repeat purchase prompted by Mend."), feedAll);
+
+      // Voucher none
+      await page.goto("http://localhost:5174/#/account");
+      await page.waitForSelector("[data-voucher='none']");
+      check("account: no voucher message", await page.getByText("No voucher. If an order arrives late, Mend adds one here.").isVisible());
+      await shot(page, "api-12-account-no-voucher");
+      inspect = await getJSON(MOCK + "/__inspect");
+      check("voucher action fetched on Account open", inspect.actions.some(a => a.action === "voucher"));
+      await page.goto("http://localhost:5174/#/p/hook-rail");
+      await page.click(".product button:has-text('Add to basket')");
+      await page.goto("http://localhost:5174/#/cart");
+      bn = await basketNumbers(page);
+      check("basket without voucher: no voucher line, items + S$6.90", bn.voucherLine === null && bn.total === "S$30.90", bn);
+      await page.click(".line .link-btn:has-text('Remove')");
+
+      // 2) held (open case) - still a real late delivery, so a new voucher is issued
+      await order(["mug-set"], "LH-1003");
+      await deliverLate("LH-1003", 2);
       await waitFeedSettled();
       f = await firstFeedText(page);
       check("feed: held (open case)", f.includes(T.held), f);
       await closeDrawer(page);
+      feedAll = await allFeedText(page);
+      check("held late delivery still issued a voucher", (feedAll.match(/Mend issued a free-delivery voucher/g) || []).length === 2, feedAll);
 
       // bad_review payload goes through too (also held, since a case is open)
       await page.goto("http://localhost:5174/#/p/candle-trio/review");
@@ -338,10 +437,20 @@ async function closeDrawer(page) {
       await shot(page, "api-05-feed-sent-held", false);
       await closeDrawer(page);
 
+      // Redeem false: the voucher expired on the server, but the browser still shows it
+      await getJSON(MOCK + "/__expire?customer_id=" + cid);
+      await order(["ash-board"], "LH-1004");
+      check("redeem false: plain message shown", await page.getByText("Your voucher had expired, so normal delivery applies.").first().isVisible());
+      const card4 = await page.locator(".order").first().textContent();
+      check("redeem false: order placed with normal S$6.90 fee (S$51.90)", card4.includes("S$51.90") && !card4.includes("Free delivery (voucher)"), card4);
+      await shot(page, "api-13-redeem-false");
+      await page.goto("http://localhost:5174/#/account");
+      check("redeem false: voucher cleared", await page.locator("[data-voucher='none']").isVisible());
+
       // 3) not a problem: on_time and review_not_low (server replies forced)
       override = { match: onEvent, reply: { ok: true, sent: false, reason: "on_time" } };
-      await order(["pantry-jars"], "LH-1003");
-      await deliverLate("LH-1003", 2);
+      await order(["pantry-jars"], "LH-1005");
+      await deliverLate("LH-1005", 2);
       await waitFeedSettled();
       f = await firstFeedText(page);
       check("feed: on_time -> not a problem", f.includes(T.notProblem), f);
@@ -359,21 +468,21 @@ async function closeDrawer(page) {
       // 4) 400 -> could not reach Mend, no retry
       override = { match: onEvent, status: 400, reply: { error: "bad_request" } };
       eventAttempts = 0;
-      await order(["hook-rail"], "LH-1004");
-      await deliverLate("LH-1004", 9);
+      await order(["hook-rail"], "LH-1006");
+      await deliverLate("LH-1006", 9);
       await waitFeedSettled();
       f = await firstFeedText(page);
       check("feed: 400 -> could not reach Mend", f.includes(T.failed), f);
       check("400 is not retried", eventAttempts === 1, eventAttempts);
-      check("order still went through after 400", (await page.locator("h2:has-text('Order LH-1004')").count()) === 1);
+      check("order still went through after 400", (await page.locator("h2:has-text('Order LH-1006')").count()) === 1);
       await closeDrawer(page);
 
       // 5) network failure -> could not reach Mend, retried twice, UI not blocked
       override = { match: onEvent, abort: true };
       eventAttempts = 0;
-      await order(["jute-rug"], "LH-1005");
+      await order(["jute-rug"], "LH-1007");
       await page.click("#demo-tab");
-      await page.click("button[data-key='dl-LH-1005-9']");
+      await page.click("button[data-key='dl-LH-1007-9']");
       check("UI not blocked while sending", await page.locator(".chip--late").first().isVisible());
       await waitFeedSettled();
       f = await firstFeedText(page);
@@ -384,8 +493,8 @@ async function closeDrawer(page) {
 
       // 6) server says not_connected (shopper typed STOP) -> message + status flips
       override = { match: onEvent, reply: { ok: true, sent: false, reason: "not_connected" } };
-      await order(["knit-throw"], "LH-1006");
-      await deliverLate("LH-1006", 2);
+      await order(["knit-throw"], "LH-1008");
+      await deliverLate("LH-1008", 2);
       await waitFeedSettled();
       f = await firstFeedText(page);
       check("feed: server not_connected", f.includes(T.notConnected), f);
@@ -435,6 +544,9 @@ async function closeDrawer(page) {
       const firstRow = await page.locator("tbody tr").first().textContent();
       check("staff view newest first, with product", firstRow.includes("Halo floor lamp") && firstRow.includes("Already reported"), firstRow);
       check("staff view shows no case ids or tokens", !(await page.content()).match(/case_[0-9a-f]{8}|start=/));
+      check("staff view has a Voucher column", (await page.locator("th:has-text('Voucher')").count()) === 1);
+      const voucherCells = await page.$$eval("tbody tr", trs => trs.map(tr => tr.lastElementChild.textContent));
+      check("staff voucher column shows Used and Expired", voucherCells.includes("Used") && voucherCells.includes("Expired"), voucherCells);
       await shot(page, "api-08-staff");
 
       // delete

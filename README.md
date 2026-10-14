@@ -133,9 +133,26 @@ Replies are shown in the Demo controls activity feed in plain words:
 
 In local mode the store shows a clearly labelled **simulated** token, does not check the code, fakes a successful connection after about 4 seconds, and sends nothing.
 
+### Free-delivery voucher
+
+Mend issues the voucher; the server enforces the rules and the store only shows and applies it.
+- Late by 1 to 2 days: a voucher. Late by 3 days or more: a voucher plus the option of a S$6.90 delivery-fee refund in Telegram.
+- The voucher covers delivery up to S$6.90, is valid 30 days, and a shopper holds one at a time. Only shoppers who connected Telegram get one.
+
+| Request body | Reply and what the store does |
+| --- | --- |
+| `{"action":"voucher","customer_id"}` | `{"ok":true,"voucher":{"code","value","expires_at"} \| null}`. Fetched when Account opens, after each late-delivery event, and on page load when Telegram is connected. |
+| `{"action":"redeem","customer_id","order_id"}` | `{"ok":true,"redeemed":true,"value","code"}` or `{"ok":true,"redeemed":false}`. Called once, when an order is placed with *Use my voucher* ticked. If `redeemed:false`, the order is placed with the normal S$6.90 fee and the store says "Your voucher had expired, so normal delivery applies." If Mend can't be reached, the order also goes through with normal delivery and the voucher is kept. |
+| Late-delivery event reply | Now also carries `"voucher": {"code","value","expires_at"} \| null`. |
+| `{"action":"events"}` | Each event may carry `"voucher": "active" \| "used" \| "expired" \| ""`, shown in the staff view's *Voucher* column. |
+
+Where it shows up: *Your voucher* panel on Account; a voucher line, *Use my voucher* checkbox and struck-through S$6.90 delivery in the basket; "Free delivery (voucher)" on orders that used it; feed notes "Mend issued a free-delivery voucher (valid until DATE)." and "Voucher used on order LH-XXXX. This is a repeat purchase prompted by Mend."; and a *Voucher* status section in Demo controls.
+
+In local mode the store simulates a voucher (code `FD-` + 6 characters) on a late delivery of 1 day or more when Telegram is (simulated) connected, and clears it when used.
+
 ### Test with the mock API
 
-`mock-api.js` is a small Node server (no dependencies) that copies the backend: the team-code check (403), connect, status, stop, delete, events, and every event reply (`sent`, `not_connected`, `open_case`, `duplicate`, `on_time`, `review_not_low`). It rejects bodies that don't match the formats above with HTTP 400.
+`mock-api.js` is a small Node server (no dependencies) that copies the backend: the team-code check (403), connect, status, stop, delete, events, every event reply (`sent`, `not_connected`, `open_case`, `duplicate`, `on_time`, `review_not_low`), and the voucher (issued on late deliveries, `voucher`, `redeem`). It rejects bodies that don't match the formats above with HTTP 400. To test an expired voucher, call `GET http://localhost:8787/__expire?customer_id=c_xxxxxx`.
 
 ```bash
 MOCK_TEAM_CODE=choose-a-test-code node mock-api.js   # http://localhost:8787, key "test-key"
@@ -145,7 +162,7 @@ Then, in a local copy of `config.js`, set `API_URL: "http://localhost:8787"` and
 
 ### Automated browser test
 
-`tests/e2e.js` runs the whole flow in Chromium with Playwright. It covers local mode, API mode against the mock (wrong code, waiting, connected, and every feed message, including 400 and network failure), the shipped config with all calls to the live backend blocked, 360/768/1280 widths, dark mode, reduced motion, blocked storage and corrupt storage. It saves screenshots and fails on any console error.
+`tests/e2e.js` runs the whole flow in Chromium with Playwright. It covers local mode, API mode against the mock (wrong code, waiting, connected, every feed message including 400 and network failure, and voucher present / none / redeem ok / redeem false with basket totals), the shipped config with all calls to the live backend blocked, 360/768/1280 widths, dark mode, reduced motion, blocked storage and corrupt storage. It saves screenshots and fails on any console error.
 
 ```bash
 npm install --no-save playwright && npx playwright install chromium

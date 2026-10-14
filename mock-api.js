@@ -7,6 +7,8 @@
 // Type the same MOCK_TEAM_CODE into the Account page to connect.
 // The mock pretends the shopper pressed Start in Telegram 5 seconds after asking for a link
 // (MOCK_CONNECT_MS changes that). GET /__inspect shows what it received (test helper only).
+// Vouchers: a connected shopper whose order is 1+ days late gets one free-delivery voucher
+// (S$6.90, 30 days, one at a time). GET /__expire?customer_id=c_xxxx makes it expire (test helper).
 "use strict";
 
 const http = require("http");
@@ -47,6 +49,7 @@ const OPTIONAL_FIELDS = { telegram_connected: v => typeof v === "boolean" };
 const customers = new Map(); // customer_id -> { first_name, token, asked_at, connected }
 const openCases = new Map(); // customer_id -> case_id
 const reported = new Set();  // customer_id|order_id|event_type
+const vouchers = new Map();  // customer_id -> { code, value, expires_at, used_on }
 const events = [];           // what the staff view sees
 const received = [];         // full event bodies, for /__inspect
 const actions = [];          // every action call, for /__inspect
@@ -72,6 +75,29 @@ function statusFor(id) {
   return c.token ? "waiting" : "not_connected";
 }
 
+const DAY = 86400000;
+const VOUCHER_VALUE = 6.9;
+function activeVoucher(id) {
+  const v = vouchers.get(id);
+  return v && !v.used_on && Date.parse(v.expires_at) > Date.now() ? v : null;
+}
+function voucherState(v) {
+  if (!v) return "";
+  if (v.used_on) return "used";
+  return Date.parse(v.expires_at) > Date.now() ? "active" : "expired";
+}
+const publicVoucher = v => (v ? { code: v.code, value: v.value, expires_at: v.expires_at } : null);
+// Issue a voucher for a late delivery: connected shoppers only, one at a time.
+function maybeIssueVoucher(b) {
+  if (b.event_type !== "late_delivery" || b.days_late < 1) return null;
+  if (statusFor(b.customer_id) !== "connected" || activeVoucher(b.customer_id)) return null;
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const code = "FD-" + [...crypto.randomBytes(6)].map(x => chars[x % chars.length]).join("");
+  const v = { code, value: VOUCHER_VALUE, expires_at: new Date(Date.now() + 30 * DAY).toISOString(), used_on: null };
+  vouchers.set(b.customer_id, v);
+  return v;
+}
+
 function handleEvent(b) {
   const decide = () => {
     if (b.event_type === "late_delivery" && b.days_late < 1) return { sent: false, reason: "on_time" };
@@ -86,14 +112,18 @@ function handleEvent(b) {
     return { sent: true, case_id };
   };
   const result = decide();
+  // A real late delivery earns a voucher even when the message is held (open case); not for duplicates.
+  const issued = result.reason === "duplicate" ? null : maybeIssueVoucher(b);
   events.push({
     at: new Date().toISOString(), event_type: b.event_type, first_name: b.first_name, order_id: b.order_id,
     product_name: b.product_name, status: result.sent ? "sent" : "not_sent",
     outcome: result.sent ? "Telegram message sent (mock)" : result.reason,
-    _customer: b.customer_id
+    _customer: b.customer_id, _voucher: issued
   });
-  console.log(`[${b.event_type}] ${b.customer_id} ${b.order_id} -> ${result.sent ? "sent " + result.case_id : result.reason}`);
-  return Object.assign({ ok: true }, result);
+  console.log(`[${b.event_type}] ${b.customer_id} ${b.order_id} -> ${result.sent ? "sent " + result.case_id : result.reason}${issued ? " + voucher " + issued.code : ""}`);
+  const reply = Object.assign({ ok: true }, result);
+  if (b.event_type === "late_delivery") reply.voucher = publicVoucher(issued);
+  return reply;
 }
 
 function send(res, status, obj) {
@@ -108,7 +138,13 @@ function send(res, status, obj) {
 
 const server = http.createServer((req, res) => {
   if (req.method === "OPTIONS") return send(res, 204);
-  if (req.method === "GET" && req.url === "/__inspect") return send(res, 200, { received, actions, openCases: [...openCases.keys()] });
+  if (req.method === "GET" && req.url === "/__inspect") return send(res, 200, { received, actions, openCases: [...openCases.keys()], vouchers: Object.fromEntries(vouchers) });
+  if (req.method === "GET" && req.url.startsWith("/__expire")) {
+    const id = new URL(req.url, "http://x").searchParams.get("customer_id");
+    const v = vouchers.get(id);
+    if (v) v.expires_at = new Date(Date.now() - 1000).toISOString();
+    return send(res, 200, { ok: !!v });
+  }
   if (req.method !== "POST") return send(res, 405, { error: "post_only" });
   if (req.headers["x-api-key"] !== KEY) return send(res, 401, { error: "bad_key" });
 
@@ -159,15 +195,30 @@ const server = http.createServer((req, res) => {
         if (!isCustomer(id)) return send(res, 400, { error: "bad_request" });
         customers.delete(id);
         openCases.delete(id);
+        vouchers.delete(id);
         for (const k of [...reported]) if (k.startsWith(id + "|")) reported.delete(k);
         for (let i = events.length - 1; i >= 0; i--) if (events[i]._customer === id) events.splice(i, 1);
         for (let i = received.length - 1; i >= 0; i--) if (received[i].customer_id === id) received.splice(i, 1);
         console.log(`[delete] ${id}`);
         return send(res, 200, { ok: true });
+      case "voucher":
+        if (!isCustomer(id)) return send(res, 400, { error: "bad_request" });
+        return send(res, 200, { ok: true, voucher: publicVoucher(activeVoucher(id)) });
+      case "redeem": {
+        if (!isCustomer(id) || !isOrder(b.order_id)) return send(res, 400, { error: "bad_request" });
+        const v = activeVoucher(id);
+        if (!v) {
+          console.log(`[redeem] ${id} ${b.order_id} -> not redeemed`);
+          return send(res, 200, { ok: true, redeemed: false });
+        }
+        v.used_on = b.order_id;
+        console.log(`[redeem] ${id} ${b.order_id} -> ${v.code}`);
+        return send(res, 200, { ok: true, redeemed: true, value: v.value, code: v.code });
+      }
       case "events":
         return send(res, 200, {
           ok: true,
-          events: events.slice(-20).reverse().map(({ _customer, ...e }) => e)
+          events: events.slice(-20).reverse().map(({ _customer, _voucher, ...e }) => Object.assign(e, { voucher: voucherState(_voucher) }))
         });
       default:
         return send(res, 400, { error: "unknown_action" });

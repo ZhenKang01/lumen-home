@@ -63,6 +63,7 @@
     off: [["circle", { cx: 10, cy: 10, r: 8.25 }], ["path", { d: "M6.5 10h7" }]],
     error: [["path", { d: "M10 2.5l8 14.5H2z" }], ["path", { d: "M10 8v4" }], ["path", { d: "M10 14.2v.4" }]],
     close: [["path", { d: "M5 5l10 10M15 5L5 15" }]],
+    ticket: [["path", { d: "M2.5 6h15v2.4a1.8 1.8 0 0 0 0 3.2V14h-15v-2.4a1.8 1.8 0 0 0 0-3.2z" }], ["path", { d: "M12.5 6.5v1.4M12.5 9.3v1.4M12.5 12.1v1.4" }]],
     star: [["path", { d: "M10 1.8l2.5 5.3 5.7.7-4.2 4 1.1 5.7L10 14.7l-5.1 2.8 1.1-5.7-4.2-4 5.7-.7z", fill: "currentColor", stroke: "none" }]]
   };
   function icon(name, cls) {
@@ -80,6 +81,7 @@
   function addDays(d, n) { return new Date(d.getTime() + n * DAY); }
   var fmtDate = new Intl.DateTimeFormat("en-SG", { day: "numeric", month: "short", year: "numeric" });
   var fmtDayUTC = new Intl.DateTimeFormat("en-SG", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
+  var fmtShort = new Intl.DateTimeFormat("en-SG", { day: "numeric", month: "short" });
   var fmtTime = new Intl.DateTimeFormat("en-SG", { hour: "numeric", minute: "2-digit", second: "2-digit" });
   function dateText(iso) { return fmtDate.format(new Date(iso)); }
   function dayText(iso) { return fmtDayUTC.format(new Date(iso)); }
@@ -104,7 +106,10 @@
   function freshState() {
     return {
       v: 2, account: null, cart: [], orders: [], reviews: [], events: [],
-      telegram: { status: "none" }, next_order: 1001, present: false
+      telegram: { status: "none" }, next_order: 1001, present: false,
+      // Free-delivery voucher, as last reported by Mend (or simulated in local mode).
+      voucher: null,      // {code, value, expires_at}
+      voucher_used: null  // {code, order_id} of the last voucher used
     };
   }
   var storage = null;
@@ -197,8 +202,69 @@
   function cartCount() { return state.cart.reduce(function (s, l) { return s + l.qty; }, 0); }
   function cartTotals() {
     var items = round2(state.cart.reduce(function (s, l) { return s + BY_ID.get(l.id).price * l.qty; }, 0));
-    var fee = state.cart.length ? CFG.DELIVERY_FEE : 0;
-    return { items: items, fee: fee, total: round2(items + fee) };
+    var v = voucherApplies() ? activeVoucher() : null;
+    var fee = !state.cart.length ? 0 : v ? feeAfter(v.value) : CFG.DELIVERY_FEE;
+    return { items: items, fee: fee, fullFee: CFG.DELIVERY_FEE, voucher: v, total: round2(items + fee) };
+  }
+
+  // ---------------------------------------------------------------- free-delivery voucher
+  // Mend issues it (the server enforces the rules); the store only shows and applies it.
+  var useVoucher = true; // basket checkbox; not saved, ticked by default
+
+  function activeVoucher() {
+    var v = state.voucher;
+    return v && v.code && Date.parse(v.expires_at) > Date.now() ? v : null;
+  }
+  function voucherApplies() { return !!(activeVoucher() && useVoucher && state.cart.length); }
+  function feeAfter(value) { return round2(Math.max(0, CFG.DELIVERY_FEE - (Number(value) || 0))); }
+  function shortDate(iso) { return fmtShort.format(new Date(iso)); }
+  function daysLeft(v) { return Math.max(0, Math.ceil((Date.parse(v.expires_at) - Date.now()) / DAY)); }
+  function voucherStatus() {
+    if (activeVoucher()) return "active";
+    if (state.voucher) return "expired";
+    if (state.voucher_used) return "used";
+    return "none";
+  }
+  // Store a voucher reported by Mend (or null). Re-renders only when something changed.
+  function setVoucher(v) {
+    var next = v && v.code
+      ? { code: String(v.code), value: Number(v.value) || CFG.DELIVERY_FEE, expires_at: String(v.expires_at) }
+      : null;
+    var prev = state.voucher;
+    if ((!prev && !next) || (prev && next && prev.code === next.code && prev.expires_at === next.expires_at)) return false;
+    state.voucher = next;
+    save();
+    voucherChanged();
+    return true;
+  }
+  function voucherChanged() {
+    var r = parseRoute();
+    var page = r && r.parts[0];
+    if (page === "account" || page === "cart" || page === "staff") keepFocus(function () { render(false); });
+    var drawer = document.getElementById("demo-drawer");
+    if (drawer && drawer.open) keepFocus(renderDrawer);
+  }
+  function refreshVoucher() {
+    if (!state.account || API.isLocal()) return;
+    API.voucher(state.account.customer_id).then(function (r) {
+      if (r && "voucher" in r) setVoucher(r.voucher);
+    }).catch(function () { /* keep what we have */ });
+  }
+  function logVoucherIssued(v) {
+    logFeed({ kind: "voucher", title: "Mend issued a free-delivery voucher (valid until " + shortDate(v.expires_at) + ").", detail: "Code " + v.code });
+  }
+  // Local mode: simulate what Mend does on a late delivery (one voucher at a time, 30 days).
+  function simulateVoucher() {
+    if (activeVoucher()) return null;
+    var chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    var bytes = new Uint8Array(6);
+    window.crypto.getRandomValues(bytes);
+    var code = "FD-" + Array.prototype.map.call(bytes, function (b) { return chars[b % chars.length]; }).join("");
+    var v = { code: code, value: CFG.DELIVERY_FEE, expires_at: new Date(Date.now() + 30 * DAY).toISOString() };
+    state.voucher = v;
+    save();
+    voucherChanged();
+    return v;
   }
   function addToCart(id) {
     var p = BY_ID.get(id);
@@ -281,21 +347,24 @@
   }
 
   // ---------------------------------------------------------------- orders
-  function placeOrder() {
+  // voucher: {code, value} when Mend accepted the voucher for this order, else null.
+  function placeOrder(voucher) {
     var now = new Date();
     var items = state.cart.map(function (l) {
       var p = BY_ID.get(l.id);
       return { id: p.id, name: p.name, category: p.category, price: p.price, qty: l.qty };
     });
     var subtotal = round2(items.reduce(function (s, i) { return s + i.price * i.qty; }, 0));
+    var fee = voucher ? feeAfter(voucher.value) : CFG.DELIVERY_FEE;
     var order = {
       id: "LH-" + state.next_order,
       placed_at: now.toISOString(),
       promised_at: addDays(utcMidnight(now), CFG.PROMISE_DAYS).toISOString(),
       items: items,
       subtotal: subtotal,
-      delivery_fee: CFG.DELIVERY_FEE,
-      total: round2(subtotal + CFG.DELIVERY_FEE),
+      delivery_fee: fee,
+      total: round2(subtotal + fee),
+      voucher_code: voucher ? voucher.code : null,
       status: "on_the_way",
       delivered_at: null,
       days_late: null
@@ -306,6 +375,45 @@
     save();
     updateChrome();
     return order;
+  }
+  // Place the basket as an order. If the voucher is ticked, Mend redeems it first (once).
+  // The order always goes through; only the delivery fee depends on the voucher.
+  var placing = false;
+  var flash = null; // one-time message for the Orders page
+  function checkout(done) {
+    if (placing) return;
+    var v = voucherApplies() ? activeVoucher() : null;
+    if (!v) { done(placeOrder(null)); return; }
+    if (API.isLocal()) { finishVoucher({ redeemed: true, code: v.code, value: v.value }, v, done); return; }
+    placing = true;
+    keepFocus(function () { render(false); });
+    var orderId = "LH-" + state.next_order;
+    API.redeem(state.account.customer_id, orderId).then(function (r) {
+      placing = false;
+      finishVoucher(r || {}, v, done);
+    }).catch(function () {
+      placing = false;
+      flash = "We couldn't check your voucher, so normal delivery applies. Your voucher is kept for next time.";
+      done(placeOrder(null));
+    });
+  }
+  function finishVoucher(r, v, done) {
+    if (r.redeemed === true) {
+      var used = { code: r.code || v.code, value: r.value != null ? r.value : v.value };
+      var o = placeOrder(used);
+      state.voucher = null;
+      state.voucher_used = { code: used.code, order_id: o.id };
+      save();
+      logFeed({ kind: "voucher", title: "Voucher used on order " + o.id + ". This is a repeat purchase prompted by Mend.", detail: "Code " + used.code });
+      done(o);
+      return;
+    }
+    var o2 = placeOrder(null);
+    state.voucher = null;
+    save();
+    flash = "Your voucher had expired, so normal delivery applies.";
+    logFeed({ kind: "info", title: "Voucher not accepted on " + o2.id, detail: "Normal delivery applies" });
+    done(o2);
   }
   function findOrder(id) { return state.orders.find(function (o) { return o.id === id; }); }
   function mainItem(order) {
@@ -430,21 +538,37 @@
 
     // Consent first: nothing leaves the browser unless Telegram is connected.
     if (!payload.telegram_connected) { settle(entry, "not_connected"); return; }
-    if (API.isLocal()) { settle(entry, "local"); return; }
+    var isLate = type === "late_delivery";
+    if (API.isLocal()) {
+      settle(entry, "local");
+      // Simulate Mend's voucher: late by 1+ days, connected, one voucher at a time.
+      if (isLate && order.days_late >= 1) {
+        var sim = simulateVoucher();
+        if (sim) { entry.voucher_code = sim.code; save(); logVoucherIssued(sim); }
+      }
+      return;
+    }
     API.sendEvent(payload).then(function (r) {
+      if (isLate && r && r.voucher && r.voucher.code) {
+        entry.voucher_code = String(r.voucher.code);
+        setVoucher(r.voucher);
+      }
       if (r && r.sent === true) {
         entry.case_id = r.case_id || null;
         settle(entry, "sent");
-        return;
+      } else {
+        var reason = r && r.reason ? String(r.reason) : "";
+        entry.reason = reason;
+        settle(entry, REASON_STATUS[reason] || "other");
+        // The server knows best: the shopper may have typed STOP in Telegram.
+        if (reason === "not_connected" && state.telegram.status === "connected") setTelegram("none");
       }
-      var reason = r && r.reason ? String(r.reason) : "";
-      entry.reason = reason;
-      settle(entry, REASON_STATUS[reason] || "other");
-      // The server knows best: the shopper may have typed STOP in Telegram.
-      if (reason === "not_connected" && state.telegram.status === "connected") setTelegram("none");
+      if (entry.voucher_code) logVoucherIssued(state.voucher || r.voucher);
     }).catch(function (err) {
       entry.error = err.message;
       settle(entry, "failed");
+    }).then(function () {
+      if (isLate) refreshVoucher();
     });
   }
   function settle(entry, status) {
@@ -463,16 +587,20 @@
     Lighting: "new lighting", Furniture: "new furniture", Kitchen: "something for your kitchen",
     Textiles: "new textiles", Decor: "something for your home", Storage: "new storage"
   };
+  // Mend offers the delivery-fee refund when an order is 3+ days late and a fee was paid.
+  function refundable(p) { return p.days_late >= 3 && p.delivery_fee > 0; }
   function previewText(p) {
     if (p.event_type === "late_delivery") {
       return "Hi " + p.first_name + ", this is Mend, Lumen Home's assistant. Your " + p.product_name +
         " (order " + p.order_id + ") arrived " + plural(p.days_late, "day") + " late, and I'm sorry. " +
         "I know waiting for " + (CATEGORY_WORDS[p.category] || "an order") + " is frustrating. " +
-        "Let's fix it first. I can refund your " + money(p.delivery_fee) + " delivery fee right now, or you can tell me what else would help.";
+        (refundable(p)
+          ? "Let's fix it first. I can refund your " + money(p.delivery_fee) + " delivery fee right now, or you can tell me what else would help."
+          : "Let's fix it first. Tell me what would help most.");
     }
     var text = "Hi " + p.first_name + ", I saw your " + p.review_score + "-star review of the " + p.product_name +
       " (order " + p.order_id + "). What went wrong? I'd like to put it right before anything else.";
-    if (p.days_late > 0) {
+    if (refundable(p)) {
       text += " I can also see it arrived " + plural(p.days_late, "day") + " late, so I can refund your " +
         money(p.delivery_fee) + " delivery fee if that is part of the problem.";
     }
@@ -781,6 +909,19 @@
         h("span", null, h("strong", null, "Present mode"), h("br"),
           h("span", { class: "small muted" }, "Larger text and no Demo controls tab. Use Exit present mode in the top bar, or press Shift + D to open these controls."))));
 
+    var vs = voucherStatus();
+    var av = activeVoucher();
+    var voucherText = {
+      active: av ? "Active: " + av.code + ", valid until " + shortDate(av.expires_at) + " (" + plural(daysLeft(av), "day") + " left)." : "",
+      expired: "Expired. Normal delivery applies.",
+      used: state.voucher_used ? "Used on order " + state.voucher_used.order_id + "." : "Used.",
+      none: "None yet. A late delivery (1 day or more) earns one."
+    }[vs];
+    var voucherSection = h("section", { class: "drawer__section", "aria-labelledby": "dr-voucher" },
+      h("h3", { id: "dr-voucher" }, "Voucher"),
+      h("p", { class: "small", style: { margin: "0 0 .4rem" }, "data-voucher-status": vs }, h("strong", null, "Status: "), voucherText),
+      h("p", { class: "small muted", style: { margin: "0" } }, "Type ", h("span", { class: "code" }, "/fastforward"), " in the Telegram chat to receive the next voucher check-in."));
+
     var reset = h("section", { class: "drawer__section", "aria-labelledby": "dr-reset" },
       h("h3", { id: "dr-reset" }, "Reset"),
       h("p", { class: "small muted" }, "Clears this browser's orders, reviews and events."),
@@ -792,11 +933,11 @@
           h("h2", { id: "drawer-title" }, "Demo controls"),
           h("p", null, "Demo tools for the live presentation. Real shoppers would not see this.")),
         closeBtn(drawer, "Close demo controls")),
-      ordersSection, feed, helper, present, reset);
+      ordersSection, feed, voucherSection, helper, present, reset);
   }
   function feedItem(e) {
-    var kindIcon = { late: "late", review: "review", connect: "link", error: "error", ok: "check", info: "info" }[e.kind] || "info";
-    var kindLabel = { late: "Late delivery", review: "Low review", connect: "Connection", error: "Error", ok: "Delivered", info: "Note" }[e.kind] || "Note";
+    var kindIcon = { late: "late", review: "review", connect: "link", error: "error", ok: "check", info: "info", voucher: "ticket" }[e.kind] || "info";
+    var kindLabel = { late: "Late delivery", review: "Low review", connect: "Connection", error: "Error", ok: "Delivered", info: "Note", voucher: "Voucher" }[e.kind] || "Note";
     var canPreview = e.payload && (e.status === "sent" || e.status === "local");
     return h("li", null,
       icon(kindIcon, "feed__icon feed__icon--" + e.kind),
@@ -1093,21 +1234,43 @@
             h("span", { class: "line__total" }, money(p.price * l.qty)))));
     }));
 
+    var held = state.account ? activeVoucher() : null;
+    var deliveryValue = t.voucher
+      ? h("dd", { class: "fee-swap" },
+        h("del", null, h("span", { class: "visually-hidden" }, "was "), money(t.fullFee)), " ",
+        h("ins", null, h("span", { class: "visually-hidden" }, "now "), money(t.fee)))
+      : h("dd", null, money(t.fee));
+    var voucherBox = held ? h("div", { class: "voucher-line" },
+      icon("ticket", "voucher-line__icon"),
+      h("div", null,
+        h("p", { class: "voucher-line__title" }, "Free-delivery voucher ", h("span", { class: "code" }, held.code)),
+        h("p", { class: "small muted", style: { margin: "0 0 .4rem" } }, "Free delivery up to " + money(held.value) + ", valid until " + shortDate(held.expires_at) + "."),
+        h("label", { class: "switch small" },
+          h("input", {
+            type: "checkbox", checked: useVoucher, "data-key": "use-voucher",
+            onchange: function (e) { useVoucher = e.target.checked; refresh(); }
+          }),
+          h("span", null, "Use my voucher")))) : null;
+
     var summary = h("section", { class: "summary", "aria-labelledby": "sum-title" },
       h("h2", { id: "sum-title", style: { fontSize: "1.3rem" } }, "Order summary"),
+      voucherBox,
       h("dl", null,
         h("dt", null, "Items (" + cartCount() + ")"), h("dd", null, money(t.items)),
-        h("dt", null, "Delivery"), h("dd", null, money(t.fee)),
+        h("dt", null, t.voucher ? "Delivery (voucher)" : "Delivery"), deliveryValue,
         h("dt", { class: "total" }, "Total"), h("dd", { class: "total" }, money(t.total))),
       h("p", { class: "small muted" }, "Promised within " + CFG.PROMISE_DAYS + " days. This is a demo, so no payment is taken."));
 
     function doPlace() {
-      var o = placeOrder();
-      toast("Order " + o.id + " placed. Thank you, " + state.account.first_name + ".");
-      location.hash = "#/orders";
+      checkout(function (o) {
+        toast("Order " + o.id + " placed. Thank you, " + state.account.first_name + ".");
+        if (flash) toast(flash);
+        if (location.hash === "#/orders") render(true); else location.hash = "#/orders";
+      });
     }
     if (state.account) {
-      summary.appendChild(h("button", { type: "button", class: "btn btn--block", onclick: doPlace }, "Place order"));
+      summary.appendChild(h("button", { type: "button", class: "btn btn--block", "data-key": "place-order", disabled: placing, onclick: doPlace },
+        placing ? "Placing order…" : "Place order"));
     } else {
       summary.appendChild(h("div", { class: "signin" },
         h("h3", null, "First, what should we call you?"),
@@ -1124,6 +1287,10 @@
         h("p", null, state.account ? "You haven't placed an order yet." : "Create an account and place an order to see it here."),
         h("a", { class: "btn", href: "#/" }, "Browse the shop")));
       return { node: node, title: "Orders" };
+    }
+    if (flash) {
+      node.appendChild(h("p", { class: "note", role: "status" }, flash));
+      flash = null;
     }
     var list = h("div", { class: "orders" });
     state.orders.slice().reverse().forEach(function (o) {
@@ -1160,8 +1327,11 @@
             h("span", { class: "num" }, money(it.price * it.qty)),
             action);
         })),
+        o.voucher_code ? h("p", { class: "order__voucher" }, icon("ticket"), "Free delivery (voucher)") : null,
         h("p", { class: "order__total" },
-          h("span", { class: "muted" }, "Items " + money(o.subtotal) + " + delivery " + money(o.delivery_fee) + " = "),
+          h("span", { class: "muted" }, "Items " + money(o.subtotal) + (o.voucher_code
+            ? (o.delivery_fee > 0 ? " + delivery " + money(o.delivery_fee) + " after voucher" : " + free delivery (voucher)")
+            : " + delivery " + money(o.delivery_fee)) + " = "),
           h("strong", null, money(o.total))),
         !delivered ? h("p", { class: "small muted", style: { margin: ".5rem 0 0" } }, "Demo tip: use Demo controls (bottom left) to deliver this order on time or late.") : null));
     });
@@ -1190,6 +1360,7 @@
           h("dt", null, "Customer id"), h("dd", null, h("span", { class: "code" }, a.customer_id))),
         h("p", { class: "small muted" }, "Your customer id is a random label made in this browser. It is how Mend tells demo shoppers apart.")),
       telegramPanel(),
+      voucherPanel(),
       dataPanel(true)));
     return { node: node, title: "Account" };
   }
@@ -1203,7 +1374,7 @@
       connected: { cls: "connected", icon: "check", text: "Connected" }
     };
     var s = statusMap[st] || statusMap.none;
-    var panel = h("section", { class: "panel", "aria-labelledby": "tg-title" },
+    var panel = h("section", { class: "panel panel--tall", "aria-labelledby": "tg-title" },
       h("h2", { id: "tg-title" }, "Telegram messages from Mend"),
       h("p", { class: "status status--" + s.cls, role: "status" }, icon(s.icon), h("span", null, h("span", { class: "visually-hidden" }, "Telegram status: "), s.text)),
       h("p", null, "If an order arrives late or you leave a low review, Mend can message you on Telegram to put it right. Only if you connect."));
@@ -1269,6 +1440,30 @@
     return panel;
   }
 
+  function voucherPanel() {
+    var v = activeVoucher();
+    var panel = h("section", { class: "panel", "aria-labelledby": "voucher-title", "data-voucher": v ? "active" : "none" },
+      h("h2", { id: "voucher-title" }, "Your voucher"));
+    if (!v) {
+      panel.appendChild(h("p", { style: { margin: "0" } }, "No voucher. If an order arrives late, Mend adds one here."));
+      if (state.voucher_used) {
+        panel.appendChild(h("p", { class: "small muted", style: { margin: ".5rem 0 0" } }, "Your last voucher was used on order " + state.voucher_used.order_id + "."));
+      }
+      return panel;
+    }
+    var left = daysLeft(v);
+    panel.appendChild(h("div", { class: "voucher-card" },
+      icon("ticket", "voucher-card__icon"),
+      h("div", null,
+        h("p", { class: "voucher-card__code" }, v.code),
+        h("p", { class: "voucher-card__what" }, "Free delivery up to " + money(v.value)),
+        h("p", { class: "small muted", style: { margin: "0" } },
+          "Valid until " + shortDate(v.expires_at) + " · " + plural(left, "day") + " left"))));
+    panel.appendChild(h("p", { class: "small muted", style: { margin: ".75rem 0 0" } },
+      "It is applied in your basket automatically. Untick “Use my voucher” there to keep it for later."));
+    return panel;
+  }
+
   function dataPanel(withDelete) {
     return h("section", { class: "panel panel--wide", "aria-labelledby": "data-title", style: withDelete ? null : { marginTop: "1.5rem" } },
       h("h2", { id: "data-title" }, "How Mend uses your data"),
@@ -1277,7 +1472,8 @@
         h("div", null, h("h3", null, "What is used"), h("p", null, "Your first name, the order (items, dates, delivery fee) and any review you write.")),
         h("div", null, h("h3", null, "What is not"), h("p", null, "No payment details, address, email or phone number. The shop never asks for them.")),
         h("div", null, h("h3", null, "Who can see it"), h("p", null, "Only the Mend demo team, and only for this hackathon demo.")),
-        h("div", null, h("h3", null, "How to stop"), h("p", null, "Type STOP in Telegram, or use Disconnect and stop messages above. Nothing is sent unless you connect."))),
+        h("div", null, h("h3", null, "How to stop"), h("p", null, "Type STOP in Telegram, or use Disconnect and stop messages above. Nothing is sent unless you connect.")),
+        h("div", null, h("h3", null, "Vouchers"), h("p", null, "If an order arrives late, Mend gives you a free-delivery voucher. Mend may check in twice before it expires. Reply STOP to turn this off."))),
       withDelete ? h("button", { type: "button", class: "btn btn--danger", "data-key": "delete", onclick: deleteMyData }, "Delete my data") : null);
   }
 
@@ -1338,16 +1534,25 @@
         if (e.status === "other" && e.reason) outcome += " (" + e.reason + ")";
         return {
           at: e.ts, event_type: e.event_type, first_name: e.first_name, order_id: e.order_id,
-          product_name: e.payload ? e.payload.product_name : "", status: STATUS_SHORT[e.status] || e.status, outcome: outcome
+          product_name: e.payload ? e.payload.product_name : "", status: STATUS_SHORT[e.status] || e.status, outcome: outcome,
+          voucher: localVoucherState(e.voucher_code)
         };
       });
+    }
+    // Status of the voucher an event issued, as this browser knows it.
+    function localVoucherState(code) {
+      if (!code) return "";
+      if (state.voucher_used && state.voucher_used.code === code) return "used";
+      if (state.voucher && state.voucher.code === code) return activeVoucher() ? "active" : "expired";
+      return "expired";
     }
     function timeOf(r) { return r.at || r.time || r.ts || ""; }
     // Server codes -> plain words. Free text from the server is shown as it is.
     var PLAIN = {
       sent: "Sent", not_sent: "Not sent", held: "Held", failed: "Failed", error: "Error",
       not_connected: "Telegram not connected", open_case: "Open case already", duplicate: "Already reported",
-      on_time: "Not a problem", review_not_low: "Not a problem"
+      on_time: "Not a problem", review_not_low: "Not a problem",
+      active: "Active", used: "Used", expired: "Expired"
     };
     function plain(v) {
       var s = String(v == null ? "" : v);
@@ -1361,18 +1566,19 @@
       tableHolder.replaceChildren(h("div", { class: "table-wrap" },
         h("table", null,
           h("caption", { class: "visually-hidden" }, "Recent Mend events, newest first"),
-          h("thead", null, h("tr", null, ["Time", "Event type", "First name", "Order id", "Product", "Status", "Outcome"].map(function (c) { return h("th", { scope: "col" }, c); }))),
+          h("thead", null, h("tr", null, ["Time", "Event type", "First name", "Order id", "Product", "Status", "Outcome", "Voucher"].map(function (c) { return h("th", { scope: "col" }, c); }))),
           h("tbody", null, rows.map(function (r) {
             var t = timeOf(r);
             var d = t ? new Date(t) : null;
             return h("tr", null,
-              h("td", { class: "num" }, d && !isNaN(d) ? dateText(t) + ", " + timeText(t) : String(t)),
+              h("td", { class: "num nowrap" }, d && !isNaN(d) ? [dateText(t), h("br"), timeText(t)] : String(t)),
               h("td", null, r.event_type === "late_delivery" ? "Late delivery" : r.event_type === "bad_review" ? "Low review" : String(r.event_type || "")),
               h("td", null, String(r.first_name || "")),
               h("td", null, String(r.order_id || "")),
               h("td", null, String(r.product_name || "")),
               h("td", null, plain(r.status)),
-              h("td", null, plain(r.outcome)));
+              h("td", null, plain(r.outcome)),
+              h("td", null, plain(r.voucher)));
           })))));
     }
     if (local) {
@@ -1481,7 +1687,11 @@
     updateChrome();
     render(false);
 
-    window.addEventListener("hashchange", function () { render(true); });
+    window.addEventListener("hashchange", function () {
+      render(true);
+      var r = parseRoute();
+      if (r && r.parts[0] === "account") refreshVoucher();
+    });
     document.querySelector(".skip-link").addEventListener("click", function (e) {
       e.preventDefault();
       var t = document.querySelector("#main h1") || document.getElementById("main");
@@ -1523,6 +1733,10 @@
           setTelegram("none");
         }
       }).catch(function () { /* offline: keep the saved status */ });
+      refreshVoucher();
+    } else {
+      var start = parseRoute();
+      if (start && start.parts[0] === "account") refreshVoucher();
     }
   }
 

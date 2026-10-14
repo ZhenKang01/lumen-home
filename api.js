@@ -135,6 +135,20 @@
       return post({ action: "delete", customer_id: customerId });
     },
 
+    // The shopper's free-delivery voucher: {ok, voucher:{code, value, expires_at} | null}.
+    // Local mode resolves {mode:"local"}; the app simulates vouchers itself.
+    voucher: function (customerId) {
+      if (isLocal()) return Promise.resolve({ mode: "local" });
+      return post({ action: "voucher", customer_id: customerId }, 1);
+    },
+
+    // Use the voucher on an order: {ok, redeemed:true, value, code} or {ok, redeemed:false}.
+    // Called once, when the order is placed. No retries, so it can't be applied twice.
+    redeem: function (customerId, orderId) {
+      if (isLocal()) return Promise.resolve({ mode: "local" });
+      return post({ action: "redeem", customer_id: customerId, order_id: orderId }, 0);
+    },
+
     // Recent events for the staff view. Resolves to an array (null in local mode).
     events: function () {
       if (isLocal()) return Promise.resolve(null);
