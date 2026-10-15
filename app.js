@@ -452,6 +452,8 @@
   }
   function publishReview(pid, orderId, rating, text) {
     var o = findOrder(orderId);
+    // Double-click guard: one review per order and product.
+    if (!o || state.reviews.some(function (r) { return r.order_id === orderId && r.product_id === pid; })) return;
     var review = {
       id: "r_" + randomHex(4), product_id: pid, order_id: orderId,
       first_name: state.account.first_name, rating: rating, text: text, created_at: new Date().toISOString()
@@ -506,7 +508,12 @@
     return entry;
   }
 
+  // Double-send guard: the same event for the same order is sent once per 15 seconds.
+  var recentEvents = {};
   function emitEvent(type, order, item, review) {
+    var guardKey = type + ":" + order.id + ":" + item.id, nowMs = Date.now();
+    if (recentEvents[guardKey] && nowMs - recentEvents[guardKey] < 15000) return;
+    recentEvents[guardKey] = nowMs;
     var payload = {
       event_type: type,
       customer_id: state.account.customer_id,
@@ -752,6 +759,7 @@
       confirm: "Reset demo", danger: true
     }).then(function (ok) {
       if (!ok) return;
+      recentEvents = {};
       state.orders = [];
       state.reviews = [];
       state.events = [];
