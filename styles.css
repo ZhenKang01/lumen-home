@@ -258,7 +258,7 @@ strong { font-weight: 650; }
 /* ---------- Forms ---------- */
 .field { display: grid; gap: .35rem; }
 .field label, .legend { font-weight: 600; font-size: .92rem; }
-input[type="text"], input[type="search"], input[type="password"], select, textarea {
+input[type="text"], input[type="email"], input[type="tel"], input[type="search"], input[type="password"], select, textarea {
   font: inherit; color: var(--ink); background: var(--paper);
   border: 1px solid var(--line-strong); border-radius: var(--radius);
   padding: .55rem .75rem; min-height: 44px; width: 100%;
@@ -269,6 +269,10 @@ input:hover, select:hover, textarea:hover { border-color: var(--ink); }
 .error { font-size: .9rem; color: var(--late); font-weight: 600; margin: 0; }
 .error::before { content: "! "; font-weight: 800; }
 .form-stack { display: grid; gap: 1.1rem; max-width: 34rem; }
+.form-stack--wide { max-width: 36rem; }
+.form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.1rem; }
+.form-grid__full { grid-column: 1 / -1; }
+@media (max-width: 34rem) { .form-grid { grid-template-columns: minmax(0, 1fr); } }
 fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
 
 .star-input { display: flex; gap: .15rem; margin-top: .35rem; }

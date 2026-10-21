@@ -2,7 +2,7 @@
 
 Lumen Home is a **fictional** home-goods shop and the live demo for **Mend** ("Fix the order, keep the customer"). When an order goes wrong, Mend, an AI assistant on Telegram, messages the customer with a fix. Judges can cause problems on stage: a late delivery or a low review.
 
-There are no real payments, addresses or deliveries. The shop only asks for a first name.
+There are no real payments, addresses or deliveries. The shop asks for a name, email, mobile and delivery address like a real shop (made-up details are fine, kept in the browser only). Mend only ever receives the first name and a random customer id.
 
 Live site: https://zhenkang01.github.io/lumen-home/
 
@@ -19,7 +19,7 @@ To host it: push to GitHub and turn on *Settings → Pages → Deploy from branc
 
 The **Quick start for judges** button in the top bar shows these steps on screen.
 
-1. **Account:** enter a first name.
+1. **Account:** fill in the sign-up form. Add `?demo` to the URL for a link that fills in Mei's details.
 2. **Connect Telegram:** enter the team code in *Account*, press *Connect Telegram*, then tap *Start* in the bot. The status changes to *Connected*.
 3. **Order:** add items to the basket and place the order.
 4. **Demo controls** (bottom left): choose *Deliver on time*, *Deliver 2 days late* or *Deliver 9 days late*. A late delivery sends a `late_delivery` event to Mend.
@@ -54,7 +54,7 @@ node tests/e2e.js . shots        # full browser test
 
 ## Privacy and responsible AI
 
-- Only a first name is collected (invented is fine). No email, phone, address or card fields.
+- The shop collects name, email, mobile and address (invented is fine, browser only). Mend gets only the first name and a random customer id. No password or card fields.
 - *How Mend uses your data* on the Account page explains what is used, who sees it and how to stop.
 - Mend is an AI. A person can be requested at any time, and refunds are limited to the delivery fee.
 - *Delete my data* clears this browser and tells the backend to delete the customer.

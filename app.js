@@ -300,6 +300,11 @@
   }
 
   // ---------------------------------------------------------------- account
+  // Like a real shop, we keep the details needed to deliver an order. They stay in this
+  // browser only. Mend never receives them: the Mend payload carries only customer_id and
+  // first_name (see sendEvent), and the server rejects any extra field.
+  var DEMO_MEI = { first_name: "Mei", last_name: "Tan", email: "mei.tan@example.com", phone: "+65 8100 0123", address: "21 Jalan Contoh", unit: "#07-12", postal: "560021" };
+
   function validateName(raw) {
     // Same rule as the Mend server: 1 to 20 letters.
     var v = String(raw || "").trim();
@@ -308,40 +313,89 @@
     if (!/^\p{L}+$/u.test(v)) return { error: "Please use letters only, as one word (no spaces, numbers or symbols)." };
     return { value: v };
   }
-  function signUp(name) {
+  function validateAccount(v) {
+    var errs = {}, out = {};
+    var f = validateName(v.first_name);
+    if (f.error) errs.first_name = f.error; else out.first_name = f.value;
+    var last = String(v.last_name || "").trim();
+    if (!last) errs.last_name = "Please enter your last name.";
+    else if (last.length > 30 || !/^\p{L}[\p{L} '’-]*$/u.test(last)) errs.last_name = "Please use letters only (spaces, hyphens and apostrophes are fine), up to 30.";
+    else out.last_name = last;
+    var em = String(v.email || "").trim().toLowerCase();
+    if (!em) errs.email = "Please enter your email address.";
+    else if (em.length > 80 || !/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]{2,}$/.test(em)) errs.email = "That doesn't look like an email address. Please check it.";
+    else out.email = em;
+    var ph = String(v.phone || "").replace(/[\s-]/g, "");
+    if (!ph) errs.phone = "Please enter a mobile number for the courier.";
+    else if (!/^(\+?65)?[3689]\d{7}$/.test(ph)) errs.phone = "Please enter a Singapore number with 8 digits, for example +65 8100 0123.";
+    else out.phone = "+65 " + ph.slice(-8, -4) + " " + ph.slice(-4);
+    var ad = String(v.address || "").trim();
+    if (ad.length < 5 || ad.length > 60) errs.address = "Please enter your street address (5 to 60 characters).";
+    else out.address = ad;
+    var un = String(v.unit || "").trim();
+    if (un.length > 12) errs.unit = "Please keep the unit short, for example #07-12."; else out.unit = un;
+    var po = String(v.postal || "").trim();
+    if (!/^\d{6}$/.test(po)) errs.postal = "Please enter a 6-digit postal code."; else out.postal = po;
+    return { ok: Object.keys(errs).length === 0, errors: errs, value: out };
+  }
+  function fullName(a) { return a.last_name ? a.first_name + " " + a.last_name : a.first_name; }
+  function addressText(a) {
+    if (!a || !a.address) return "";
+    return a.address + (a.unit ? ", " + a.unit : "") + ", Singapore " + (a.postal || "");
+  }
+  function signUp(d) {
     if (state.account) {
-      state.account.first_name = name;
+      Object.assign(state.account, d);
     } else {
-      state.account = { customer_id: "c_" + randomHex(3), first_name: name, created_at: new Date().toISOString() };
-      logFeed({ kind: "info", title: "Account created for " + name, detail: "Customer id " + state.account.customer_id });
+      state.account = Object.assign({ customer_id: "c_" + randomHex(3), created_at: new Date().toISOString() }, d);
+      logFeed({ kind: "info", title: "Account created for " + d.first_name, detail: "Customer id " + state.account.customer_id });
     }
     save();
     updateChrome();
   }
-  function nameForm(opts) {
-    var errId = opts.id + "-error";
-    var input = h("input", { type: "text", id: opts.id, name: "first_name", autocomplete: "given-name", maxlength: 20, required: true, "aria-describedby": opts.id + "-hint" });
-    var err = h("p", { class: "error", id: errId, hidden: true });
-    var form = h("form", { class: "form-stack", novalidate: true },
-      h("div", { class: "field" },
-        h("label", { for: opts.id }, "First name"),
-        input,
-        h("p", { class: "hint", id: opts.id + "-hint" }, "Only your first name. An invented one is fine. No email, phone or address needed."),
-        err),
+  function accountForm(opts) {
+    var fields = {};
+    var order = ["first_name", "last_name", "email", "phone", "address", "unit", "postal"];
+    function field(key, label, attrs, hint) {
+      var id = opts.id + (key === "first_name" ? "" : "-" + key.replace("_", "-"));
+      var err = h("p", { class: "error", id: id + "-error", hidden: true });
+      var input = h("input", Object.assign({ type: "text", id: id, name: key, "aria-describedby": id + "-error" }, attrs));
+      fields[key] = { input: input, err: err };
+      return h("div", { class: "field" }, h("label", { for: id }, label), input, hint ? h("p", { class: "hint" }, hint) : null, err);
+    }
+    var form = h("form", { class: "form-stack form-stack--wide", novalidate: true },
+      h("div", { class: "form-grid" },
+        field("first_name", "First name", { autocomplete: "given-name", maxlength: 20, required: true }),
+        field("last_name", "Last name", { autocomplete: "family-name", maxlength: 30, required: true }),
+        field("email", "Email", { type: "email", autocomplete: "email", maxlength: 80, required: true }, "For your order confirmation."),
+        field("phone", "Mobile number", { type: "tel", autocomplete: "tel", maxlength: 16, required: true }, "The courier may call you."),
+        h("div", { class: "form-grid__full" }, field("address", "Delivery address", { autocomplete: "address-line1", maxlength: 60, required: true })),
+        field("unit", "Unit number (optional)", { autocomplete: "address-line2", maxlength: 12 }),
+        field("postal", "Postal code", { autocomplete: "postal-code", inputmode: "numeric", maxlength: 6, required: true })),
+      h("p", { class: "hint" }, "Demo only: please use made-up details. They stay in this browser, and Mend never receives them."),
       h("div", { class: "btn-row" }, h("button", { type: "submit", class: "btn" }, opts.submitLabel)));
+    if (/[?&]demo\b/.test(location.search)) {
+      form.appendChild(h("p", null, h("button", { type: "button", class: "link-btn", onclick: function () {
+        order.forEach(function (k) { fields[k].input.value = DEMO_MEI[k]; });
+      } }, "Fill in Mei's details")));
+    }
     form.addEventListener("submit", function (e) {
       e.preventDefault();
-      var res = validateName(input.value);
-      if (res.error) {
-        err.textContent = res.error;
-        err.hidden = false;
-        input.setAttribute("aria-invalid", "true");
-        input.setAttribute("aria-describedby", opts.id + "-hint " + errId);
-        input.focus();
-        return;
-      }
+      var vals = {};
+      order.forEach(function (k) { vals[k] = fields[k].input.value; });
+      var res = validateAccount(vals);
+      var firstBad = null;
+      order.forEach(function (k) {
+        var f = fields[k];
+        var msg = res.errors[k];
+        f.err.textContent = msg || "";
+        f.err.hidden = !msg;
+        if (msg) { f.input.setAttribute("aria-invalid", "true"); if (!firstBad) firstBad = f.input; }
+        else f.input.removeAttribute("aria-invalid");
+      });
+      if (firstBad) { firstBad.focus(); return; }
       signUp(res.value);
-      opts.onDone(res.value);
+      opts.onDone(res.value.first_name);
     });
     return form;
   }
@@ -731,7 +785,7 @@
     var local = API.isLocal();
     confirmDialog({
       title: "Delete your data?",
-      body: "This removes your name, basket, orders, reviews and Telegram link from this browser" +
+      body: "This removes your account details, basket, orders, reviews and Telegram link from this browser" +
         (local ? "." : ", and asks Mend to delete what it holds about you."),
       confirm: "Delete my data", danger: true
     }).then(function (ok) {
@@ -755,7 +809,7 @@
   function resetDemo() {
     confirmDialog({
       title: "Reset the demo?",
-      body: "This clears this browser's orders, reviews and activity feed. Your name, basket and Telegram link stay.",
+      body: "This clears this browser's orders, reviews and activity feed. Your account, basket and Telegram link stay.",
       confirm: "Reset demo", danger: true
     }).then(function (ok) {
       if (!ok) return;
@@ -843,7 +897,7 @@
       h("ol", { class: "steps" },
         h("li", null, h("div", null,
           h("h3", null, "Create an account"),
-          h("p", null, "Just a first name. ", h("button", { type: "button", class: "link-btn", onclick: go("#/account") }, "Go to Account")))),
+          h("p", null, "Your name, email and delivery address. ", h("button", { type: "button", class: "link-btn", onclick: go("#/account") }, "Go to Account")))),
         h("li", null, h("div", null,
           h("h3", null, "Connect Telegram"),
           h("p", null, "Enter the team code in Account, then press Connect Telegram and tap Start in the bot."))),
@@ -1267,6 +1321,7 @@
         h("dt", null, "Items (" + cartCount() + ")"), h("dd", null, money(t.items)),
         h("dt", null, t.voucher ? "Delivery (voucher)" : "Delivery"), deliveryValue,
         h("dt", { class: "total" }, "Total"), h("dd", { class: "total" }, money(t.total))),
+      state.account && state.account.address ? h("p", { class: "small" }, h("strong", null, "Delivering to "), fullName(state.account) + ", " + addressText(state.account)) : null,
       h("p", { class: "small muted" }, "Promised within " + CFG.PROMISE_DAYS + " days. This is a demo, so no payment is taken."));
 
     function doPlace() {
@@ -1281,8 +1336,8 @@
         placing ? "Placing order…" : "Place order"));
     } else {
       summary.appendChild(h("div", { class: "signin" },
-        h("h3", null, "First, what should we call you?"),
-        nameForm({ id: "cart-name", submitLabel: "Save name and place order", onDone: doPlace })));
+        h("h3", null, "First, where should we deliver?"),
+        accountForm({ id: "cart-name", submitLabel: "Save details and place order", onDone: doPlace })));
     }
     node.appendChild(h("div", { class: "cart" }, lines, summary));
     return { node: node, title: "Basket" };
@@ -1351,9 +1406,9 @@
     var node = h("div", { class: "wrap page" });
     if (!state.account) {
       node.appendChild(h("h1", { id: "page-title", tabindex: "-1" }, "Create your account"));
-      node.appendChild(h("p", { class: "muted", style: { maxWidth: "36rem" } }, "No password, no email. Your account lives in this browser only."));
+      node.appendChild(h("p", { class: "muted", style: { maxWidth: "36rem" } }, "No password needed for this demo. Your details live in this browser only."));
       node.appendChild(h("div", { class: "panel", style: { maxWidth: "36rem" } },
-        nameForm({ id: "acc-name", submitLabel: "Create account", onDone: function (n) { toast("Welcome, " + n + "."); render(true); } })));
+        accountForm({ id: "acc-name", submitLabel: "Create account", onDone: function (n) { toast("Welcome, " + n + "."); render(true); } })));
       node.appendChild(dataPanel(false));
       return { node: node, title: "Account" };
     }
@@ -1363,10 +1418,13 @@
       h("section", { class: "panel", "aria-labelledby": "acc-title" },
         h("h2", { id: "acc-title" }, "Your account"),
         h("dl", { class: "kv" },
-          h("dt", null, "First name"), h("dd", null, a.first_name),
+          h("dt", null, "Name"), h("dd", null, fullName(a)),
+          h("dt", null, "Email"), h("dd", null, a.email || "Not given"),
+          h("dt", null, "Mobile"), h("dd", null, a.phone || "Not given"),
+          h("dt", null, "Delivery address"), h("dd", null, addressText(a) || "Not given"),
           h("dt", null, "Orders"), h("dd", null, String(state.orders.length)),
           h("dt", null, "Customer id"), h("dd", null, h("span", { class: "code" }, a.customer_id))),
-        h("p", { class: "small muted" }, "Your customer id is a random label made in this browser. It is how Mend tells demo shoppers apart.")),
+        h("p", { class: "small muted" }, "Mend receives only your first name and a random customer id (made in this browser), plus order details. Your email, mobile and address stay with the shop.")),
       telegramPanel(),
       voucherPanel(),
       dataPanel(true)));
@@ -1477,8 +1535,8 @@
       h("h2", { id: "data-title" }, "How Mend uses your data"),
       h("p", null, "Mend is an AI assistant, not a person. You can ask for a human at any time, and Mend's refunds are limited to the delivery fee."),
       h("div", { class: "data-grid" },
-        h("div", null, h("h3", null, "What is used"), h("p", null, "Your first name, the order (items, dates, delivery fee) and any review you write.")),
-        h("div", null, h("h3", null, "What is not"), h("p", null, "No payment details, address, email or phone number. The shop never asks for them.")),
+        h("div", null, h("h3", null, "What is used"), h("p", null, "Your first name, a random customer id, the order (items, dates, delivery fee) and any review you write.")),
+        h("div", null, h("h3", null, "What is not"), h("p", null, "Your last name, email, mobile number and address. The shop keeps them to deliver your order and never passes them to Mend. No payment details are collected.")),
         h("div", null, h("h3", null, "Who can see it"), h("p", null, "Only the Mend demo team, and only for this hackathon demo.")),
         h("div", null, h("h3", null, "How to stop"), h("p", null, "Type STOP in Telegram, or use Disconnect and stop messages above. Nothing is sent unless you connect.")),
         h("div", null, h("h3", null, "Vouchers"), h("p", null, "If an order arrives late, Mend gives you a free-delivery voucher. Mend may check in twice before it expires. Reply STOP to turn this off."))),

@@ -28,6 +28,18 @@ const T = {
   wrongCode: "That code is not right. Telegram messages are only enabled for the demo team."
 };
 
+
+// Fill the sign-up form (id = the first-name input id; the other fields follow the same prefix).
+async function fillAccount(page, id, first) {
+  await page.fill("#" + id, first || "Mei");
+  await page.fill("#" + id + "-last-name", "Tan");
+  await page.fill("#" + id + "-email", "mei.tan@example.com");
+  await page.fill("#" + id + "-phone", "8100 0123");
+  await page.fill("#" + id + "-address", "21 Jalan Contoh");
+  await page.fill("#" + id + "-unit", "#07-12");
+  await page.fill("#" + id + "-postal", "560021");
+}
+
 const results = [];
 function check(name, cond, extra) {
   results.push({ name, ok: !!cond });
@@ -125,7 +137,7 @@ async function closeDrawer(page) {
       check("file:// home renders 18 products", (await page.locator(".tile").count()) === 18);
       check("demo banner visible", await page.getByText("Demo store. No real payments or deliveries.").isVisible());
       await page.goto(pathToFileURL(path.join(ROOT, "index.html")).href + "#/account");
-      await page.fill("#acc-name", "Mei");
+      await fillAccount(page, "acc-name", "Mei");
       await page.click("text=Create account");
       await page.waitForSelector("#team-code");
       check("shipped config: team code box shown (server checks it)", await page.locator("#team-code").isVisible());
@@ -158,14 +170,15 @@ async function closeDrawer(page) {
       check("review form locked before delivery", await page.getByText("after it has been delivered").isVisible());
       await page.click(".product button:has-text('Add to basket')");
       await page.goto("http://localhost:5173/#/cart");
-      await page.click("text=Save name and place order");
+      await page.click("text=Save details and place order");
       check("empty name shows error", await page.getByText("Please enter a first name.").isVisible());
+      await fillAccount(page, "cart-name", "Mei");
       await page.fill("#cart-name", "Wei Ling");
-      await page.click("text=Save name and place order");
+      await page.click("text=Save details and place order");
       check("name with a space rejected (server format: letters only)", await page.getByText("Please use letters only").isVisible());
       check("name box limited to 20 characters", (await page.getAttribute("#cart-name", "maxlength")) === "20");
-      await page.fill("#cart-name", "Mei");
-      await page.click("text=Save name and place order");
+      await fillAccount(page, "cart-name", "Mei");
+      await page.click("text=Save details and place order");
       await page.waitForSelector("h2:has-text('Order LH-1001')");
 
       await page.goto("http://localhost:5173/#/account");
@@ -310,7 +323,7 @@ async function closeDrawer(page) {
       }
 
       await page.goto("http://localhost:5174/#/account");
-      await page.fill("#acc-name", "Mei");
+      await fillAccount(page, "acc-name", "Mei");
       await page.click("text=Create account");
       await page.waitForSelector("#team-code");
       check("API: connect disabled until a code is typed", await page.locator("button[data-key='tg-connect']").isDisabled());
@@ -578,8 +591,8 @@ async function closeDrawer(page) {
       await page.waitForSelector("h1");
       await page.click(".product button:has-text('Add to basket')");
       await page.goto("http://localhost:5173/#/cart");
-      await page.fill("#cart-name", "Mei");
-      await page.click("text=Save name and place order");
+      await fillAccount(page, "cart-name", "Mei");
+      await page.click("text=Save details and place order");
       await page.waitForSelector(".order");
       await page.click("#demo-tab");
       await page.click("button[data-key='dl-LH-1001-9']");
@@ -608,7 +621,7 @@ async function closeDrawer(page) {
       const imgs = await page.evaluate(() => [...document.images].map(i => ({ alt: i.getAttribute("alt"), w: i.getAttribute("width"), h: i.getAttribute("height") })));
       check("all images have alt + width/height", imgs.every(i => i.alt !== null && i.w && i.h));
       await page.goto("http://localhost:5173/#/account");
-      await page.fill("#acc-name", "Mei");
+      await fillAccount(page, "acc-name", "Mei");
       await page.click("text=Create account");
       for (const route of ["#/", "#/p/halo-lamp", "#/cart", "#/orders", "#/account", "#/about", "#/staff", "#/x"]) {
         await page.goto("http://localhost:5173/" + route);

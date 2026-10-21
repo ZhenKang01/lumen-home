@@ -14,7 +14,7 @@ Fictional home-goods demo store for the Mend hackathon. Plain HTML/CSS/JS. It mu
 
 ## Rules
 - Never use `innerHTML` / `outerHTML` / `insertAdjacentHTML`. Build DOM with `h()` (text nodes) and `icon()` / `svgEl()`.
-- Only a first name is collected. No email, phone, address or card fields.
+- The shop collects what a real shop needs to deliver: first and last name, email, mobile, delivery address (made-up details, kept in this browser only). No password, no card fields. Mend never gets any of it: the Mend payload stays customer_id + first_name only (the e2e test checks the exact keys).
 - Event body = first-prompt payload + `action` (= event_type). Don't add or rename fields; `mock-api.js` rejects extras.
 - Server formats: customer_id `^c_[a-z0-9]{4,24}$`, first_name 1-20 letters, order_id `LH-` + 3-8 digits.
 - The team code is typed on the Account page and sent only with `connect`. Never store it, put it in config, print it, or log it.
