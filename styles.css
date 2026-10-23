@@ -503,7 +503,8 @@ dialog::backdrop { background: var(--backdrop); }
 
 /* ---------- Toasts ---------- */
 .toasts {
-  position: fixed; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom, 0px)); z-index: 60;
+  /* bottom 104px keeps toasts above the MantaGO chat bubble (bottom-right, ~84px tall) */
+  position: fixed; right: 16px; bottom: calc(104px + env(safe-area-inset-bottom, 0px)); z-index: 60;
   display: grid; gap: .5rem; justify-items: end; pointer-events: none; max-width: calc(100vw - 32px);
 }
 .toast {
@@ -511,7 +512,7 @@ dialog::backdrop { background: var(--backdrop); }
   padding: .7rem 1rem; border-radius: 4px; box-shadow: 0 6px 24px rgba(0, 0, 0, .2); font-size: .93rem; max-width: 26rem;
 }
 @media (max-width: 600px) {
-  .toasts { left: 16px; right: 16px; bottom: calc(72px + env(safe-area-inset-bottom, 0px)); justify-items: stretch; }
+  .toasts { left: 16px; right: 16px; bottom: calc(104px + env(safe-area-inset-bottom, 0px)); justify-items: stretch; }
 }
 
 /* ---------- Footer ---------- */
